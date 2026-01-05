@@ -1,0 +1,16 @@
+name: univideo
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - ffmpeg
+
+  - pytorch=2.4.1
+  - torchvision
+  - pytorch-cuda=12.1
+
+  - pip:
+      - -r requirements.txt

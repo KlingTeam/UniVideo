@@ -1,35 +1,41 @@
-from ast import Raise
-import inspect
-import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from typing import Optional, List
+import torch
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union, Literal
-
+import numpy as np
 import torch
 from torchvision import transforms
-import PIL.Image
 from PIL import Image
+from einops import rearrange
 from diffusers import DiffusionPipeline
 from diffusers.pipelines.pipeline_utils import ImagePipelineOutput
-from diffusers.utils import deprecate
 from diffusers.video_processor import VideoProcessor
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
-from einops import rearrange
-from diffusers.pipelines.hunyuan_video.pipeline_output import HunyuanVideoPipelineOutput
-from transformers import FlaxAutoModelForSeq2SeqLM, PretrainedConfig
+from transformers import PretrainedConfig
+from diffusers.models.autoencoders.autoencoder_kl_hunyuan_video import AutoencoderKLHunyuanVideo
+from diffusers.utils import BaseOutput
 
 
-from autoencoder_kl_hunyuan_video import AutoencoderKLHunyuanVideo
-from transformer_hunyuan_video import HunyuanVideoTransformer3DModel, TwoLayerMLP
-from mllm_encoder import MLLMInContext, MLLMInContextConfig
-
-import numpy as np
-import os
-import torch
+from transformer_univideo_hunyuan_video import HunyuanVideoTransformer3DModel, TwoLayerMLP
+from mllm_encoder import MLLMInContext
+from utils import read_and_preprocess_cond_video, read_and_preprocess_cond_image, pack_data
 
 
-# Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img.retrieve_latents
+@dataclass
+class UniVideoPipelineOutput(BaseOutput):
+    """
+    Output class for UniVideo pipeline.
+
+    Args:
+        frames: video/image outputs.
+        text: optional text outputs for understanding tasks.
+    """
+    frames: Optional[torch.Tensor] = None
+    text: Optional[List[str]] = None
+
+
 def retrieve_latents(
     encoder_output: torch.Tensor, generator: Optional[torch.Generator] = None, sample_mode: str = "sample"
 ):
@@ -42,24 +48,6 @@ def retrieve_latents(
     else:
         raise AttributeError("Could not access latents of provided encoder_output")
 
-def pad_to_target_shape(tensor, target_shape):
-    padding = []  # [w1, w2, h1, h2, f1, f2, c1, c2, b1, b2]
-    for current, target in zip(tensor.shape, target_shape):
-        padding = [0, target - current] + padding
-    padded_tensor = torch.nn.functional.pad(tensor, padding)
-    mask = torch.ones_like(tensor[:, :1], dtype=tensor.dtype) # [b, 1, f, h, w]
-    padded_mask = torch.nn.functional.pad(mask, padding, value=0)
-    return padded_tensor, padded_mask
-
-def pack_data(data):
-    sizes = [t.size() for t in data]
-    _, c, max_f, max_h, max_w = [max(sizes_dim) for sizes_dim in zip(*sizes)]
-    res, mask = [], []
-    for ten in data:
-        ten, m = pad_to_target_shape(ten, [1, c, max_f, max_h, max_w])
-        res.append(ten)
-        mask.append(m)
-    return torch.cat(res, 0), torch.cat(mask, 0)
 
 class UniVideoPipelineConfig(PretrainedConfig):
    def __init__(
@@ -68,7 +56,6 @@ class UniVideoPipelineConfig(PretrainedConfig):
         mllm_use_cond_pixels: bool = False,
         mllm_cond_video_num_frames: int = 8,
         timestep_shift: float = 1.0,
-        match_snr: bool = False,
         hunyuan_model_id: str = "hunyuanvideo-community/HunyuanVideo",
         enable_gradient_checkpointing: bool = True,
         **kwargs,
@@ -78,7 +65,6 @@ class UniVideoPipelineConfig(PretrainedConfig):
         self.mllm_use_cond_pixels = mllm_use_cond_pixels
         self.mllm_cond_video_num_frames = mllm_cond_video_num_frames
         self.timestep_shift = timestep_shift
-        self.match_snr = match_snr
         self.enable_gradient_checkpointing = enable_gradient_checkpointing
         self.hunyuan_model_id = hunyuan_model_id
 
@@ -154,51 +140,42 @@ class UniVideoPipeline(DiffusionPipeline):
         return latents
     
     def _pad_image(self, image, target_width, target_height, color=(255, 255, 255)):
-        img_height, img_width, _ = image.shape
-        delta_w = target_width - img_width
-        delta_h = target_height - img_height
-        padding_left = delta_w // 2
-        padding_top = delta_h // 2
+        img_h, img_w, _ = image.shape
+        dw = target_width  - img_w
+        dh = target_height - img_h
+        pad_left  = dw // 2
+        pad_top   = dh // 2
         canvas = np.full((target_height, target_width, 3), color, dtype=np.uint8)
-        canvas[padding_top:padding_top + img_height, padding_left:padding_left + img_width] = image
-        new_image = torch.from_numpy(canvas).permute(2, 0, 1).unsqueeze(0).contiguous().to(torch.float32)
-        new_image = self.vae_transforms(new_image)
-        new_image = new_image.clip(-1, 1)
-        return new_image  # (1, 3, H, W)
+        canvas[pad_top:pad_top + img_h, pad_left:pad_left + img_w] = image
+        x = torch.from_numpy(canvas).permute(2, 0, 1).unsqueeze(0).contiguous().to(torch.float32)
+        # Apply VAE preprocessing and clamp to [-1, 1]
+        x = self.vae_transforms(x)
+        x = x.clip(-1, 1)
+        return x  # (1, 3, H, W)
     
     @torch.no_grad()
-    def _encode_vae_images(self, image_list, latent_h, latent_w):
+    def _vae_encode_ref_images(self, image_list, latent_h, latent_w):
         # image_list [PIL.Image.Image,...]
         image_h, image_w = latent_h * self.vae_scale_factor_spatial, latent_w * self.vae_scale_factor_spatial
-        image_short_edge = min(image_h, image_w)
+        min_hw = min(image_h, image_w)
         img_latents = [] # for bs=1 the first element
         for idx in range(len(image_list)):
-            image = image_list[idx].resize((image_short_edge, image_short_edge), resample=Image.Resampling.BICUBIC)
+            image = image_list[idx].resize((min_hw, min_hw), resample=Image.Resampling.BICUBIC)
             tensor = self._pad_image(np.array(image), image_w, image_h)
             tensor = rearrange(tensor, "b c h w  -> b 1 c h w")
             img_latent = self.pixel2latents(tensor, in_pattern="b f c h w", out_pattern="b c f h w")
             img_latents.append(img_latent)
-        img_latents = torch.cat(img_latents, 2) # [(1, c, num_id_images, h, w), ...]
-        img_latents, masks = pack_data([img_latents]) # (b, c, num_id_images, h, w) but b = 1 for now
+        img_latents = torch.cat(img_latents, 2) # [(1, c, num_ref_images, h, w), ...]
+        img_latents, masks = pack_data([img_latents]) # (b, c, num_ref_images, h, w) but b = 1 for now
         return img_latents, masks, len(image_list)
 
     @torch.no_grad()
-    def _encode_vae_pixel_values(self, pixel_values): 
+    def _vae_encode_pixel_values(self, pixel_values): 
         assert isinstance(pixel_values, list) and pixel_values[0].dim() == 4  # pixel_values: [(f c h w)]
         latents = [self.pixel2latents(
             pixel_value.unsqueeze(0), 
             in_pattern="b f c h w", 
             out_pattern="b c f h w") for pixel_value in pixel_values]
-        latents, masks = pack_data(latents)
-        return latents, masks
-
-    @torch.no_grad()
-    def _encode_vae_image_i2v(self, i2v_img_pixel_values): 
-        assert isinstance(i2v_img_pixel_values, list) and i2v_img_pixel_values[0].dim() == 5  # i2v_img_pixel_values: [(1 f c h w)]
-        latents = [self.pixel2latents(
-            i2v_img_pixel_value, 
-            in_pattern="b f c h w", 
-            out_pattern="b c f h w") for i2v_img_pixel_value in i2v_img_pixel_values]
         latents, masks = pack_data(latents)
         return latents, masks
 
@@ -221,6 +198,50 @@ class UniVideoPipeline(DiffusionPipeline):
         latents = latents * self.vae.config.scaling_factor
         latents = rearrange(latents, f"{vae_pattern} -> {out_pattern}", b=batch_size)
         return latents
+    
+    @torch.no_grad()
+    def mllm_generation(self, prompts, images=None, videos=None, device=None, dtype=None):
+        """
+        mllm tokenizing + mllm encoding
+        
+        Args:
+            prompts: List of text prompts
+            images: [[PIL.Image.Image,...] x b]
+            videos: [[torch.tensor (f h w c) 0-255] x b]
+            device: Target device
+            dtype: Target dtype
+        """
+        if prompts is None:
+            raise ValueError("prompts must be provided")
+        
+        # Use MLLM tokenizer
+        tokenize_fn = self.mllm_encoder.get_tokenize_fn()
+        tokenizer = self.mllm_encoder.get_tokenizer()
+        
+        if not images:  # [] or None
+            images = None
+        if not videos:
+            videos = None
+
+        batch = tokenize_fn(tokenizer, prompts, images, videos, add_queires=False)
+
+        inputs = {}
+        for k, v in batch.items():
+            if isinstance(v, torch.Tensor):
+                inputs[k] = v.to(device)
+            else:
+                inputs[k] = v
+        
+        output_text = self.mllm_encoder.generation(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            pixel_values=inputs.get("pixel_values"),
+            image_grid_thw=inputs.get("image_grid_thw"),
+            pixel_values_videos=inputs.get("pixel_values_videos"),
+            video_grid_thw=inputs.get("video_grid_thw"),
+            second_per_grid_ts=inputs.get("second_per_grid_ts"),
+        )
+        return output_text
     
     @torch.no_grad()
     def get_mllm_prompt_embeddings(self, prompts, images=None, videos=None, device=None, dtype=None):
@@ -272,9 +293,9 @@ class UniVideoPipeline(DiffusionPipeline):
     def __call__(
         self,
         prompts: Union[str, List[str]] = None,
-        ref_images_pil: Union[None, List] = None,  # [[PIL.Image.Image,...] x b]
-        cond_pixel_values: Union[None, List] = None,  # [[(f c h w),...]]. (-1,1). bs=1
-        i2v_img_pixel_values: Union[None, List] = None,  # normalized [(1 f c h w), (1, 1, 3, 352, 704), ...,]
+        ref_images: Union[None, List] = None,  # [[PIL.Image.Image,...] x b]
+        cond_image_path: Union[None, List] = None,  # [str, ...]
+        cond_video_path: Union[None, List] = None,  # [str, ...]
         task: str = "",
         negative_prompt: str = "",
         num_inference_steps: int = 30,  # HunyuanVideo default
@@ -283,11 +304,11 @@ class UniVideoPipeline(DiffusionPipeline):
         image_guidance_scale: float = 1.5,
         num_images_per_prompt: Optional[int] = 1,
         num_frames: int = 129,  # HunyuanVideo default
-        cond_num_frames: Optional[int] = None,
+        cond_num_frames: Optional[int] = 129,
         fps: float = 15.0,  # HunyuanVideo default
         cond_fps: Optional[float] = None,
-        height: Optional[int] = None,
-        width: Optional[int] = None,
+        height: Optional[int] = 720,
+        width: Optional[int] = 1280,
         cond_height: Optional[int] = None,
         cond_width: Optional[int] = None,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
@@ -313,6 +334,7 @@ class UniVideoPipeline(DiffusionPipeline):
             process_call_back = None
 
         # 1. Check inputs and set defaults
+        # TODO: remove this
         height = height or self.transformer.config.sample_size * self.vae_scale_factor
         width = width or self.transformer.config.sample_size * self.vae_scale_factor
         cond_height = cond_height or height
@@ -321,7 +343,6 @@ class UniVideoPipeline(DiffusionPipeline):
         cond_fps = cond_fps or fps
         timestep_shift = timestep_shift or self.univideo_config.timestep_shift
 
-        # TODO: check check_inputs
         # 2. Batch size
         if prompts is not None and isinstance(prompts, str):
             batch_size = 1
@@ -339,12 +360,53 @@ class UniVideoPipeline(DiffusionPipeline):
         print(f"do_img_cfg:{do_img_cfg}")
         print(f"negative_prompt:{negative_prompt} ")
 
+        cond_pixel_norm_fchw = None
+        cond_img_pil = None
+        cond_frames_uint8_fhwc = None
+        if cond_video_path is not None:
+            cond_pixel_norm_fchw, cond_frames_uint8_fhwc, _ = read_and_preprocess_cond_video(
+                cond_video_path,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                vae_spatial_scale_factor=self.vae_scale_factor_spatial,
+                spatial_patch_size=2, # HunyuanVideo Default setting.
+                vae_temporal_scale_factor=self.vae_scale_factor_temporal,
+                temporal_patch_size= 1, # HunyuanVideo Default setting.
+            )
+            cond_pixel_norm_fchw = [cond_pixel_norm_fchw] # TODO: fix this batching
+        if cond_image_path is not None:
+            cond_pixel_norm_fchw, cond_img_pil, _  = read_and_preprocess_cond_image(
+                image_path=cond_image_path,
+                height=height,
+                width=width,
+                vae_spatial_scale_factor=self.vae_scale_factor_spatial,
+                spatial_patch_size=2, # HunyuanVideo Default setting.
+            )
+            cond_pixel_norm_fchw = [cond_pixel_norm_fchw]
+
+        if task == "understanding":
+            mllm_input_imgs = [] # [[PIL.Image.Image,...] x b]
+            mllm_input_videos = [] # [[torch.tensor (f h w c) 0-255] x b]
+            if cond_img_pil is not None:
+                mllm_input_imgs = [[cond_img_pil]]
+            if cond_frames_uint8_fhwc is not None:
+                mllm_input_videos = [[cond_frames_uint8_fhwc]]
+            text_output = self.mllm_generation(
+                prompts=[prompts],
+                images=mllm_input_imgs,
+                videos=mllm_input_videos,
+                device=device,
+                dtype=self.transformer.dtype
+            )
+            return UniVideoPipelineOutput(text=text_output)
+
         # 4. Prepare latents
         latent_channels = self.transformer.config.in_channels
-     
-        # If visual condition are provided then build latent from this shape
-        if cond_pixel_values is not None:
-            _, _, cond_h, cond_w = cond_pixel_values[0].shape # [[(f c h w),...]]. (-1,1). bs=1
+
+        # If visual condition are provided then build latent from this shape  
+        if cond_pixel_norm_fchw is not None:
+            _, _, cond_h, cond_w = cond_pixel_norm_fchw[0].shape # [[(f c h w),...]]. (-1,1). bs=1
             shape = (
                 batch_size,
                 latent_channels,
@@ -352,7 +414,7 @@ class UniVideoPipeline(DiffusionPipeline):
                 int(cond_h) // self.vae_scale_factor_spatial,
                 int(cond_w) // self.vae_scale_factor_spatial,
             )
-            print(f"Initialzie latent shape from Condition Pixel Values H W: {cond_pixel_values[0].shape} and latent {shape}")
+            print(f"Initialzie latent shape from Condition Pixel Values H W: {cond_pixel_norm_fchw[0].shape} and latent {shape}")
             latents = randn_tensor(shape, generator=generator, device=device, dtype=self.dtype)
         else:
             latents = self.prepare_latents(
@@ -381,112 +443,75 @@ class UniVideoPipeline(DiffusionPipeline):
             mllm_input_videos = None
 
         #  Reference Image
-        if ref_images_pil is not None:   # [[PIL.Image.Image,...]]
-            assert len(ref_images_pil) == 1 and len(ref_images_pil[0]) > 0
-            ref_img_latents, ref_img_attn_mask, _ = self._encode_vae_images(
-                    ref_images_pil[0], latent_h, latent_w
+        if ref_images is not None:   # [[PIL.Image.Image,...]]
+            assert len(ref_images) == 1 and len(ref_images[0]) > 0
+            # vit
+            if self.univideo_config.mllm_use_ref_img:
+                mllm_input_imgs = ref_images
+
+            # vae
+            ref_img_latents, ref_img_attn_mask, _ = self._vae_encode_ref_images(
+                ref_images[0], latent_h, latent_w
             )
             assert latents.shape[3:] == ref_img_latents.shape[3:], \
                 f"H/W mismatch: {latents.shape} vs {ref_img_latents.shape}"
-                
-            if self.univideo_config.mllm_use_ref_img:
-                mllm_input_imgs = ref_images_pil
-
             print(f"before add ref image latents.shape: {latents.shape}, ref_img_latents:{ref_img_latents.shape}")
             latents = torch.cat([ref_img_latents, latents], dim=2)
             attention_mask = torch.cat([ref_img_attn_mask, attention_mask], dim=2)
             is_cond = torch.cat([torch.ones(ref_img_latents.shape[2], dtype=torch.bool, device=latents.device), is_cond], dim=0)
             print(f"after add ref image latents.shape: {latents.shape}")
+
+        # I2V task
+        if task == "i2v":
+            assert cond_pixel_norm_fchw is not None
+            # vit
+            if self.univideo_config.mllm_use_cond_pixels:
+                mllm_input_imgs = [[cond_img_pil]]
+
+            # vae
+            cond_latents, cond_latents_attn_mask = self._vae_encode_pixel_values(cond_pixel_norm_fchw)  # b c f h w
+            latents[:, :, 0:1] = cond_latents
+            attention_mask[:, :, 0:1] = cond_latents_attn_mask
+            is_cond[0] = True
+            print(f"[DEBUG] I2V task, latents.shape: {latents.shape}")
                 
-        # Visual condition
-        if cond_pixel_values is not None:
-            cond_latents, cond_latents_attn_mask = self._encode_vae_pixel_values(cond_pixel_values)
+        # Editing task
+        if task == "i2i_edit" or task == "i+i2i_edit" or task == "v2v_edit":
+            assert cond_pixel_norm_fchw is not None
+            # vit
+            if self.univideo_config.mllm_use_cond_pixels:
+                # image editing
+                if cond_image_path is not None:  
+                    # i+i2i_edit
+                    if len(mllm_input_imgs) > 0: 
+                        mllm_input_imgs[0].append(cond_img_pil)
+                    # i2i_edit
+                    else:
+                        mllm_input_imgs = [[cond_img_pil]]
+                # v2v_edit
+                elif cond_frames_uint8_fhwc is not None:  
+                    total = cond_frames_uint8_fhwc.shape[0]
+                    steps = min(total, self.univideo_config.mllm_cond_video_num_frames)
+                    idx = torch.linspace(0, total - 1, steps=steps, device=cond_frames_uint8_fhwc.device).round().long()
+                    cond_frames_uint8_fhwc = cond_frames_uint8_fhwc.index_select(0, idx)  # (steps,H,W,3) uint8
+                    print(f"[DEBUG] cond_frames_uint8_fhwc shape: {cond_frames_uint8_fhwc.shape}")
+                    if cond_frames_uint8_fhwc.shape[0] > 0:
+                        mllm_input_videos = [[cond_frames_uint8_fhwc]]
+                    else:
+                        print("[DEBUG] Skipping append: no frames selected for cond_frames_uint8_fhwc")
+                else:
+                    raise ValueError(f"missing visual condition for editing tasks") 
+
+            # vae
+            cond_latents, cond_latents_attn_mask = self._vae_encode_pixel_values(cond_pixel_norm_fchw)
             assert latents.shape[3:] == cond_latents.shape[3:], \
                     f"H/W mismatch: {latents.shape} vs {cond_latents.shape}"
-
-            # mllm input
-            if self.univideo_config.mllm_use_cond_pixels:
-              for _cond_pixel_value in cond_pixel_values:  
-                    _cond_pixel_value = _cond_pixel_value.clone()
-                    _f = _cond_pixel_value.shape[0]  # (f c h w). (-1,1)
-                    if _f == 1: # i+i2i_edit or i2i_edit
-                        _first_frame =  _cond_pixel_value[0]  # (c h w)
-                        _first_frame = (
-                            (_first_frame * 127.5 + 127.5)
-                            .round()
-                            .clamp(0, 255)
-                            .to(torch.uint8)
-                            .permute(1, 2, 0)  # (h w c)
-                            .contiguous()
-                            .cpu()
-                            .numpy()
-                        )
-                        if len(mllm_input_imgs) > 0: # i+i2i_edit
-                            mllm_input_imgs[0].append(Image.fromarray(_first_frame))
-                        else:  # i2i_edit
-                            mllm_input_imgs.append([Image.fromarray(_first_frame)])
-                    else:  # v2v_edit
-                        steps = min(_f, self.univideo_config.mllm_video_cond_num_frames)
-                        idx = torch.linspace(0, _f - 1, steps=steps, device=_cond_pixel_value.device).round().to(torch.long)
-                        _cond_frames = _cond_pixel_value.index_select(0, idx)
-                        _cond_frames = (
-                            _cond_frames.mul(127.5).add_(127.5)   # scale to [0,255]
-                            .round_()
-                            .clamp_(0, 255)
-                            .to(torch.uint8)
-                            .permute(0, 2, 3, 1)  # (f h w c)
-                            .contiguous()
-                        )
-                        print(f"[DEBUG] _cond_frames shape: {_cond_frames.shape}")
-                        if _cond_frames.shape[0] > 0:
-                            mllm_input_videos.append([_cond_frames])
-                        else:
-                            print("[DEBUG] Skipping append: no frames selected for _cond_frames")
-
             print(f"[DEBUG] before add cond video latents.shape: {latents.shape}, cond_latents:{cond_latents.shape}")
             latents = torch.cat([latents, cond_latents], dim=2)
             attention_mask = torch.cat([attention_mask, cond_latents_attn_mask], dim=2)
             is_cond = torch.cat([is_cond, torch.ones(cond_latents.shape[2], dtype=torch.bool, device=latents.device)], dim=0)
             print(f"[DEBUG] after add cond video latents.shape: {latents.shape}")
-        
-        # I2V task
-        # batch of imgs in list, normalized [(1 f c h w), (1, 1, 3, 352, 704), ...,]
-        if task == "i2v" and i2v_img_pixel_values is not None:
-            image_h, image_w = latent_h * self.vae_scale_factor_spatial, latent_w * self.vae_scale_factor_spatial
-            i2v_img_pixel_values_resized = []
-            for i2v_img_pixel_value in i2v_img_pixel_values:  # shape (1, f, c, h, w)
-                _, f, c, h, w = i2v_img_pixel_value.shape
-                i2v_img_pixel_value = i2v_img_pixel_value.view(1 * f, c, h, w)  # (1*f, c, h, w)
-                import torch.nn.functional as F
-                resized = F.interpolate(
-                    i2v_img_pixel_value,
-                    size=(image_h, image_w),
-                    mode="bicubic",
-                    align_corners=False
-                )
-                resized = resized.view(1, f, c, image_h, image_w)  # back to (1, f, c, H, W)
-                i2v_img_pixel_values_resized.append(resized)
-            i2v_img_latents, i2v_img_attn_mask = self._encode_vae_image_i2v(i2v_img_pixel_values_resized)  # b c f h w
-            latents = torch.cat([i2v_img_latents, latents], dim=2)
-            attention_mask = torch.cat([i2v_img_attn_mask, attention_mask], dim=2)
-            is_cond = torch.cat([torch.ones(1, dtype=torch.bool, device=latents.device), is_cond], dim=0)
 
-            if self.univideo_config.mllm_use_cond_pixels:
-                for _video in i2v_img_pixel_values:  # [(1 f c h w), (1, 73, 3, 352, 704), ...,]. (-1,1). one video per example
-                    _video = _video.clone()
-                    _first_frame = _video.squeeze(0)[0]  # (C, H, W)
-                    _first_frame = (
-                        (_first_frame * 127.5 + 127.5)
-                        .round()
-                        .clamp(0, 255)
-                        .to(torch.uint8)
-                        .permute(1, 2, 0)  # (h w c)
-                        .contiguous()
-                        .cpu()
-                        .numpy()
-                    )
-                    mllm_input_imgs.append([Image.fromarray(_first_frame)])
-            print(f"[DEBUG] I2V task, latents.shape: {latents.shape}")
 
         assert is_cond.shape[0] == latents.shape[2], "full latents should match with is_cond over f dimension"
 
@@ -521,14 +546,14 @@ class UniVideoPipeline(DiffusionPipeline):
             device=device,
             dtype=self.transformer.dtype
         )
-        prompt_embeds_ci, prompt_attention_mask_ci = self.get_mllm_prompt_embeddings(
+        prompt_embeds_negtxt_vit, prompt_attention_mask_negtxt_vit = self.get_mllm_prompt_embeddings(
             prompts=[negative_prompt],
             images=mllm_input_imgs,
             videos=mllm_input_videos,
             device=device,
             dtype=self.transformer.dtype
         )
-        prompt_embeds_ci_ct, prompt_attention_mask_ci_ct = self.get_mllm_prompt_embeddings(
+        prompt_embeds_txt_vit, prompt_attention_mask_txt_vit = self.get_mllm_prompt_embeddings(
             prompts=[prompts],
             images=mllm_input_imgs,
             videos=mllm_input_videos,
@@ -537,7 +562,7 @@ class UniVideoPipeline(DiffusionPipeline):
         )
 
         idx_no_cond = (~is_cond).nonzero(as_tuple=False).squeeze(-1)      # [T_keep]
-        assert idx_no_cond.numel() > 0, "All f dimension are conditioned; nothing to train."
+        assert idx_no_cond.numel() > 0, "All f dimension are conditioned"
 
         # 7. Denoising loop
         timesteps_all = torch.linspace(1.0, 0, num_inference_steps + 1, device=latents.device)
@@ -554,12 +579,7 @@ class UniVideoPipeline(DiffusionPipeline):
             t0 = time.time()
             for i, t in enumerate(timesteps):
                 guidance_tensor = torch.tensor([6.0], device=device) * 1000.0 # Guidance tensor (HunyuanVideo scales by 1000)
-
-                if self.univideo_config.match_snr:
-                    scale_factor = latents_full.shape[2] ** 0.5
-                    current_timestep = t / (scale_factor - scale_factor * t + t)
-                else:
-                    current_timestep = t
+                current_timestep = t
 
                 if not torch.is_tensor(current_timestep):
                     is_mps = latents_full.device.type == "mps"
@@ -586,54 +606,54 @@ class UniVideoPipeline(DiffusionPipeline):
                         guidance=guidance_tensor,
                         return_dict=False,
                     )[0]
-                    v_pred_cmmdit = self.transformer(
-                        hidden_states=latents_full,                   # [1,C,T,H,W]
-                        timestep=current_timestep * 999,             # match original scaling
-                        encoder_hidden_states=prompt_embeds_uncond,
-                        encoder_attention_mask=prompt_attention_mask_uncond,
+                    v_pred_negtxt_vit_vae = self.transformer(
+                        hidden_states=latents_full,  
+                        timestep=current_timestep * 999,   
+                        encoder_hidden_states=prompt_embeds_negtxt_vit,
+                        encoder_attention_mask=prompt_attention_mask_negtxt_vit,
                         # video_voxel_mask=attention_mask,
                         guidance=guidance_tensor,
                         return_dict=False,
                     )[0]
-                    v_pred_cmmdit = v_pred_cmmdit.index_select(2, idx_no_cond)
-                    v_pred_cmllm_cmmdit = self.transformer(
-                        hidden_states=latents_full,                   # [1,C,T,H,W]
-                        timestep=current_timestep * 999,              # match original scaling
-                        encoder_hidden_states=prompt_embeds_ci_ct,
-                        encoder_attention_mask=prompt_attention_mask_ci_ct,
+                    v_pred_negtxt_vit_vae = v_pred_negtxt_vit_vae.index_select(2, idx_no_cond)
+                    v_pred_txt_vit_vae = self.transformer(
+                        hidden_states=latents_full,   # VAE
+                        timestep=current_timestep * 999, 
+                        encoder_hidden_states=prompt_embeds_txt_vit,
+                        encoder_attention_mask=prompt_attention_mask_txt_vit,
                         # video_voxel_mask=attention_mask,
                         guidance=guidance_tensor,
                         return_dict=False,
                     )[0]
-                    v_pred_cmllm_cmmdit = v_pred_cmllm_cmmdit.index_select(2, idx_no_cond)
+                    v_pred_txt_vit_vae = v_pred_txt_vit_vae.index_select(2, idx_no_cond)
                     v_pred = (
                         v_pred_uncond
-                        +  image_guidance_scale * (v_pred_cmmdit - v_pred_uncond)
-                        +  guidance_scale * (v_pred_cmllm_cmmdit - v_pred_cmmdit)
+                        +  image_guidance_scale * (v_pred_negtxt_vit_vae - v_pred_uncond)
+                        +  guidance_scale * (v_pred_txt_vit_vae - v_pred_negtxt_vit_vae)
                     )
                 elif  guidance_scale > 1.0:
-                    print(f"[DEBUG] ci cict 2 pass")
-                    v_pred_ci = self.transformer(
+                    print(f"[DEBUG] 2 pass")
+                    v_pred_negtxt_vit_vae = self.transformer(
                         hidden_states=latents_full,                   # [1,C,T,H,W]
                         timestep=current_timestep * 999,             # match original scaling
-                        encoder_hidden_states=prompt_embeds_ci,
-                        encoder_attention_mask=prompt_attention_mask_ci,
+                        encoder_hidden_states=prompt_embeds_negtxt_vit,
+                        encoder_attention_mask=prompt_attention_mask_negtxt_vit,
                         # video_voxel_mask=attention_mask,
                         guidance=guidance_tensor,
                         return_dict=False,
                     )[0]
-                    v_pred_ci = v_pred_ci.index_select(2, idx_no_cond)
-                    v_pred_ci_ct = self.transformer(
+                    v_pred_negtxt_vit_vae = v_pred_negtxt_vit_vae.index_select(2, idx_no_cond)
+                    v_pred_txt_vit_vae = self.transformer(
                         hidden_states=latents_full,                   # [1,C,T,H,W]
                         timestep=current_timestep * 999,             # match original scaling
-                        encoder_hidden_states=prompt_embeds_ci_ct,
-                        encoder_attention_mask=prompt_attention_mask_ci_ct,
+                        encoder_hidden_states=prompt_embeds_txt_vit,
+                        encoder_attention_mask=prompt_attention_mask_txt_vit,
                         # video_voxel_mask=attention_mask,
                         guidance=guidance_tensor,
                         return_dict=False,
                     )[0]
-                    v_pred_ci_ct = v_pred_ci_ct.index_select(2, idx_no_cond)
-                    v_pred = v_pred_ci + guidance_scale * (v_pred_ci_ct - v_pred_ci)
+                    v_pred_txt_vit_vae = v_pred_txt_vit_vae.index_select(2, idx_no_cond)
+                    v_pred = v_pred_negtxt_vit_vae + guidance_scale * (v_pred_txt_vit_vae - v_pred_negtxt_vit_vae)
                 else:
                     raise ValueError(f"guidance_scale: {guidance_scale} and image_guidance_scale:{image_guidance_scale} is not support") 
 
@@ -689,4 +709,4 @@ class UniVideoPipeline(DiffusionPipeline):
         if not return_dict:
             return (video,)
 
-        return HunyuanVideoPipelineOutput(frames=video)
+        return UniVideoPipelineOutput(frames=video)

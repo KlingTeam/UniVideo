@@ -1,0 +1,19 @@
+mllm_config:
+    _gradient_checkpointing: false
+    crop_system_tokens: true
+    crop_vision_tokens: false
+    mllm_id: Qwen/Qwen2.5-VL-7B-Instruct
+    system_prompt: You are a helpful assistant for generating visual content. Read
+      the following instruction carefully and strictly follow it to produce the required
+      output.
+    system_tokens_drop_idx: 0
+    use_chat_template: true
+    num_metaqueries: 0
+    max_input_text_tokens: 2048
+pipeline_config:
+    hunyuan_model_id: hunyuanvideo-community/HunyuanVideo
+    mllm_use_ref_img: true
+    mllm_use_cond_pixels: true
+    mllm_cond_video_num_frames: 2
+    timestep_shift: 7
+transformer_ckpt_path: ckpts/univideo_qwen2p5vl7b_hidden_hunyuanvideo/model.ckpt

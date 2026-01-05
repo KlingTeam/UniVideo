@@ -1,0 +1,14 @@
+numpy
+pillow
+packaging
+typing_extensions
+tqdm
+einops==0.8.1
+diffusers==0.34.0
+transformers==4.51.3
+tokenizers==0.21.1
+huggingface_hub==0.36.0
+accelerate==1.5.1
+safetensors==0.5.3
+imageio
+imageio-ffmpeg

@@ -14,15 +14,6 @@ from transformers import (
 import os
 # from .transformer_encoder import Qwen2Encoder
 
-def hf_local_snapshot(repo_id: str, revision: str = "main") -> str:
-    repo_dir = repo_id.replace("/", "--")
-    base = "/m2v_intern/weicong/cache/huggingface/hub"
-    ref_file = os.path.join(base, f"models--{repo_dir}", "refs", revision)
-    with open(ref_file) as f:
-        rev = f.read().strip()
-    return os.path.join(base, f"models--{repo_dir}", "snapshots", rev)
-
-
 def _find_subseq(seq, sub):
     for i in range(len(seq) - len(sub) + 1):
         if seq[i:i+len(sub)] == sub:
@@ -68,11 +59,7 @@ class MLLMInContextConfig(PretrainedConfig):
         num_metaqueries: int = 64,
         _gradient_checkpointing: bool = True,
         max_input_text_tokens: int = 1024,
-        connector_num_hidden_layers: int = 24,
-        connector_out_dim: Optional[int] = None,
         system_prompt: str = "You will be given a video or its caption. Please describe the content of the video in detail in your own words.",
-        connector_method: str = "qwen2+mlp",
-        connector_mlp_hidden_dim: int = 3076,
         use_chat_template: bool = True,
         crop_system_tokens: bool = True,
         crop_vision_tokens: bool = True,
@@ -84,11 +71,7 @@ class MLLMInContextConfig(PretrainedConfig):
         self.num_metaqueries = num_metaqueries
         self._gradient_checkpointing = _gradient_checkpointing
         self.max_input_text_tokens = max_input_text_tokens
-        self.connector_num_hidden_layers = connector_num_hidden_layers
-        self.connector_out_dim = connector_out_dim
         self.system_prompt = system_prompt
-        self.connector_method = connector_method
-        self.connector_mlp_hidden_dim = connector_mlp_hidden_dim
         self.use_chat_template = use_chat_template
         self.crop_system_tokens = crop_system_tokens
         self.crop_vision_tokens = crop_vision_tokens
@@ -113,16 +96,17 @@ class MLLMInContext(PreTrainedModel):
         if self.mllm_type == "qwenvl":
             print(f"Using Qwen MLLM {config.mllm_id}")
             self.mllm_backbone = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                hf_local_snapshot(config.mllm_id, "main"), attn_implementation="sdpa", 
-                # hf_local_snapshot(config.mllm_id, "main"), attn_implementation="flash_attention_2", 
-                # torch_dtype=torch.bfloat16
+                config.mllm_id, 
+                # attn_implementation="sdpa", 
+                attn_implementation="flash_attention_2", 
+                torch_dtype=torch.bfloat16
             )
-            # TODO: should we activate this in the CoT setting?
             # self.mllm_backbone.model.config.use_sliding_window = False
             # self.mllm_backbone.model.config.sliding_window = None
 
             # If use metaquery
             if config.num_metaqueries > 0:
+                print(f"Before resize embed_tokens: {self.mllm_backbone.model.embed_tokens.weight.shape}")
                 num_embeddings = self.mllm_backbone.get_input_embeddings().num_embeddings
                 self.num_embeddings = num_embeddings
                 try:
@@ -133,6 +117,7 @@ class MLLMInContext(PreTrainedModel):
                     self.mllm_backbone.resize_token_embeddings(
                         num_embeddings + config.num_metaqueries + 2, mean_resizing=False
                     )
+                print(f"After resize embed_tokens: {self.mllm_backbone.model.embed_tokens.weight.shape}")
 
                 def freeze_hook(grad):
                     print(f"  [Query] Original tokens (frozen): {self.num_embeddings}")
@@ -159,10 +144,12 @@ class MLLMInContext(PreTrainedModel):
                 
             self.mllm_hidden_size = self.mllm_backbone.config.hidden_size
             min_pixels = 256 * 28 * 28
-            max_pixels = 1280 * 28 * 28
-            # max_pixels = 480 * 854 
+            # max_pixels = 1280 * 28 * 28
+            max_pixels = 480 * 854 
             self.tokenizer = AutoProcessor.from_pretrained(
-                hf_local_snapshot(config.mllm_id, "main"), min_pixels=min_pixels, max_pixels=max_pixels
+                config.mllm_id, 
+                min_pixels=min_pixels, 
+                max_pixels=max_pixels
             ) # Qwen2_5_VLProcessor
             self.tokenizer.tokenizer.padding_side = "left"
             self.tokenizer.resize_fn = None
@@ -176,7 +163,6 @@ class MLLMInContext(PreTrainedModel):
         self.tokenizer.max_input_text_tokens = config.max_input_text_tokens
         self.tokenizer.num_metaqueries = config.num_metaqueries
         self.tokenizer.system_prompt = config.system_prompt
-        self.tokenizer.connector_method = config.connector_method
         self.tokenizer.use_chat_template = getattr(config, 'use_chat_template', True)
         self.tokenizer.crop_system_tokens = getattr(config, 'crop_system_tokens', True)
 
@@ -217,69 +203,6 @@ class MLLMInContext(PreTrainedModel):
             self.boi_token_id = tokenizer.convert_tokens_to_ids("<begin_of_img>")
             self.eoi_token_id = tokenizer.convert_tokens_to_ids("<end_of_img>")
 
-        self.connector_in_dim = self.mllm_hidden_size
-        if config.connector_out_dim is not None:
-            self.connector_out_dim = config.connector_out_dim
-        else:
-            self.connector_out_dim = 4096 # Default to 4096 for 1b transformer cross_attention_dim
-
-        # Create connector based on method
-        if config.connector_method == "mlp":
-            # Simple 2-layer MLP connector for all tokens: input_dim -> hidden_dim -> output_dim
-            print(f"Using mlp connector: {self.connector_in_dim} -> {config.connector_mlp_hidden_dim} -> {self.connector_out_dim}")
-            self.connector = nn.Sequential(
-                nn.Linear(self.connector_in_dim, config.connector_mlp_hidden_dim),
-                nn.GELU(),
-                nn.Linear(config.connector_mlp_hidden_dim, self.connector_out_dim),
-            )
-        elif config.connector_method == "qwen2+mlp":
-            # Original complex connector with Qwen2Encoders
-            print(f"Using qwen2+mlp connector with {config.connector_num_hidden_layers} layers")
-            
-            # norm = RMSNorm(self.connector_out_dim, eps=1e-5, elementwise_affine=True)
-            # # Initialize norm weight based on original MetaQuery (math.sqrt(5.5) for Sana-like models)
-            # import math
-            # input_scale = math.sqrt(5.5)  # Original MetaQuery default for Sana
-            # with torch.no_grad():
-            #     norm.weight.fill_(input_scale)
-
-            # encoder = Qwen2Encoder(
-            #     Qwen2Config(
-            #         hidden_size=self.connector_in_dim,
-            #         intermediate_size=self.connector_in_dim * 4,
-            #         num_hidden_layers=config.connector_num_hidden_layers,
-            #         num_attention_heads=self.connector_in_dim // 64,
-            #         num_key_value_heads=self.connector_in_dim // 64,
-            #         initializer_range=0.014,
-            #         use_cache=False,
-            #         rope=true_divide,
-            #         qk_norm=True,
-            #     ),
-            # )
-            # self.connector = nn.Sequential(
-            #     encoder,
-            #     nn.Linear(self.connector_in_dim, self.connector_out_dim),
-            #     nn.GELU(approximate="tanh"),
-            #     nn.Linear(self.connector_out_dim, self.connector_out_dim),
-            #     # norm,
-            # )
-        elif config.connector_method == "none":
-            # No connector - use raw MLLM hidden states directly
-            print(f"Using no connector - raw MLLM hidden states will be used directly")
-            self.connector = None
-        else:
-            raise ValueError(f"Unknown connector_method: {config.connector_method}")
-        
-        # Only register hooks if connector exists
-        if self.connector is not None:
-            def log_grad_hook(name):
-                def hook(grad):
-                    print(f"[HOOK] Gradient for {name} | shape: {grad.shape} | norm: {grad.norm():.6f}")
-                return hook
-            for name, param in self.connector.named_parameters():
-                if param.requires_grad:
-                    param.register_hook(log_grad_hook(name))
-
         if config._gradient_checkpointing:
             try:
                 self.mllm_backbone.gradient_checkpointing_enable(
@@ -288,10 +211,6 @@ class MLLMInContext(PreTrainedModel):
                 print("Enable Gradient Checkpoint for MLLM backbone")
             except:
                 pass
-            # if self.connector is not None and not isinstance(self.connector, nn.Identity):
-            #     for module in self.connector:
-            #         if isinstance(module, Qwen2Encoder):
-            #             module.gradient_checkpointing_enable({"use_reentrant": False})
 
     def get_tokenizer(self):
         return self.tokenizer
@@ -348,7 +267,8 @@ class MLLMInContext(PreTrainedModel):
         texts,         # ["" x b] one sentence per example
         images=None,   # [[PIL.Image.Image x num] x b]
         videos=None,   # [[torch.tensor (f h w c) 0-255 x num] x b]
-        text_response=None, 
+        text_response=None,
+        add_queires=True,  # For video/image generation we add queires otherwise for text generation we don't add them.
         add_generation_prompt=True
     ):
         if not isinstance(texts, List):
@@ -467,7 +387,7 @@ class MLLMInContext(PreTrainedModel):
         ]
         if text_response is not None:
             prompts = [p + t.strip() for p, t in zip(prompts, text_response)]
-        if tokenizer.num_metaqueries > 0:
+        if tokenizer.num_metaqueries > 0 and add_queires:
             prompts = [p + suffix for p in prompts]
 
         # DEBUG PRINT
@@ -595,7 +515,120 @@ class MLLMInContext(PreTrainedModel):
         print(f"[KEEP-TEXT] Kept hidden states shape={kept.shape}, new_attn shape={new_attn.shape}")
         return kept.unsqueeze(0), new_attn.unsqueeze(0)
 
-    @torch.no_grad()   # TODO: fix this 
+
+    def _extract_text_and_queries_bs1(
+        self,
+        input_ids: torch.Tensor,        # [1, T]
+        attention_mask: torch.Tensor,   # [1, T]
+        last_hidden: torch.Tensor       # [1, T, D]
+    ):
+        """
+        Returns:
+            embeds : [1, L, D]   (text first, then query tokens)
+            attn   : [1, L]
+        Assumes bs=1.
+        """
+        assert input_ids.shape[0] == 1 and attention_mask.shape[0] == 1 and last_hidden.shape[0] == 1
+
+        ids  = input_ids[0]       # [T]
+        attn = attention_mask[0]  # [T]
+        hs   = last_hidden[0]     # [T, D]
+        T, D = hs.shape
+
+        # --- valid span (handles left padding) ---
+        valid = (attn == 1).nonzero(as_tuple=False).flatten()
+        if valid.numel() == 0:
+            print("[TEXT+QUERY] No valid tokens; returning empty.")
+            return hs.new_zeros(1, 0, D), attn.new_zeros(1, 0)
+
+        first_valid = int(valid.min().item())
+        end_idx = int(valid.max().item()) + 1
+
+        # --- choose start_idx: vision crop > system crop ---
+        start_idx = None
+
+        def _tok_id(token_str: str):
+            tok = getattr(self.tokenizer, "tokenizer", self.tokenizer)
+            try:
+                tid = tok.convert_tokens_to_ids(token_str)
+                return tid if isinstance(tid, int) and tid != -1 else None
+            except Exception:
+                return None
+
+        # always crop vision token
+        ve_id = _tok_id("<|vision_end|>")
+        if ve_id is not None:
+            ve_pos = (ids == ve_id).nonzero(as_tuple=False).flatten()
+            if ve_pos.numel() > 0:
+                start_idx = int(ve_pos.max().item()) + 1
+                print(f"[TEXT+QUERY] vision_end at {ve_pos.tolist()} → start_idx={start_idx}")
+
+        if start_idx is None:
+            drop_idx = int(getattr(self.tokenizer, "system_tokens_drop_idx", 0))
+            start_idx = first_valid + drop_idx
+            print(f"[TEXT+QUERY] no vision_end → drop system drop_idx={drop_idx}, start_idx={start_idx}")
+
+        start_idx = max(0, min(start_idx, end_idx))
+
+        kept_hs  = hs[start_idx:end_idx]     # [L, D]
+        kept_ids = ids[start_idx:end_idx]    # [L]
+        L = kept_hs.shape[0]
+
+        if L == 0:
+            print("[TEXT+QUERY] crop produced empty; returning empty.")
+            return hs.new_zeros(1, 0, D), attn.new_zeros(1, 0)
+
+        try:
+            tok = getattr(self.tokenizer, "tokenizer", self.tokenizer)
+            window_text = tok.decode(
+                kept_ids.tolist(),
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+            print(f"[TEXT+QUERY] Preview after crop → {repr(window_text)}")
+        except Exception as e:
+            print(f"[TEXT+QUERY] Preview decode failed: {e}")
+
+        # --- split text vs query ---
+        device = kept_hs.device
+        text_mask  = torch.ones(L, dtype=torch.bool, device=device)
+        query_mask = torch.zeros(L, dtype=torch.bool, device=device)
+
+        if getattr(self.tokenizer, "num_metaqueries", 0) > 0:
+            boi = getattr(self, "boi_token_id", None)
+            eoi = getattr(self, "eoi_token_id", None)
+
+            if boi is not None and eoi is not None:
+                boi_pos = (kept_ids == boi).nonzero(as_tuple=False).flatten()
+                eoi_pos = (kept_ids == eoi).nonzero(as_tuple=False).flatten()
+
+                if boi_pos.numel() > 0 and eoi_pos.numel() > 0:
+                    boi_i = int(boi_pos[0].item())
+                    eoi_i = int(eoi_pos[0].item())
+
+                    if eoi_i > boi_i + 1:
+                        query_mask[boi_i + 1 : eoi_i] = True
+
+                    text_mask[boi_i : eoi_i + 1] = False
+                else:
+                    print("[TEXT+QUERY] BOI/EOI not found → all tokens treated as text.")
+            else:
+                print("[TEXT+QUERY] missing BOI/EOI ids → all tokens treated as text.")
+
+        # --- concat text then queries ---
+        text_hs  = kept_hs[text_mask]     # [Lt, D]
+        query_hs = kept_hs[query_mask]    # [Lq, D]
+
+        concat_hs = torch.cat([text_hs, query_hs], dim=0)
+        concat_attn = torch.ones(concat_hs.shape[0], device=device, dtype=attn.dtype)
+
+        print(
+            f"[TEXT+QUERY] final concat shape={concat_hs.shape} "
+            f"(text={text_hs.shape}, query={query_hs.shape})"
+        )
+
+        return concat_hs.unsqueeze(0), concat_attn.unsqueeze(0)
+
     def encode_condition(
         self, input_ids, attention_mask, pixel_values, image_grid_thw, pixel_values_videos, video_grid_thw, second_per_grid_ts
     ):
@@ -615,87 +648,37 @@ class MLLMInContext(PreTrainedModel):
         else:
             raise ValueError(f"Unsupported model: {self.mllm_type}")
 
-        # keep only text per your rule
-        prompt_embeds, attention_mask = self._crop_hidden_bs1(input_ids, attention_mask, last_hidden)
-        print(f"[TEXT-ONLY per rule] {prompt_embeds.shape}")
-
+        if self.tokenizer.num_metaqueries > 0:
+            prompt_embeds, attention_mask = self._extract_text_and_queries_bs1(
+                input_ids, attention_mask, last_hidden
+            )
+        else:
+            prompt_embeds, attention_mask = self._crop_hidden_bs1(input_ids, attention_mask, last_hidden)
+            print(f"[TEXT-ONLY per rule] {prompt_embeds.shape}")
+        
         # Return raw
         return prompt_embeds, attention_mask
     
-
-        # # Handle different token cropping strategies
-        # if self.tokenizer.num_metaqueries > 0:
-        #     # MetaQuery mode: Extract tokens between BOI and EOI
-        #     try:
-        #         boi_pos = torch.where(input_ids == self.boi_token_id)[1]
-        #         eoi_pos = torch.where(input_ids == self.eoi_token_id)[1]
-        #     except RuntimeError as e:
-        #         # Diagnose the real issue: missing BOI/EOI tokens
-        #         print(f"[ERROR] CUDA error in token position finding, investigating root cause:")
-        #         print(f"  Original error: {e}")
-        #         print(f"  input_ids shape: {input_ids.shape}, device: {input_ids.device}, dtype: {input_ids.dtype}")
-        #         print(f"  boi_token_id: {self.boi_token_id}, eoi_token_id: {self.eoi_token_id}")
-                
-        #         # Check if BOI/EOI tokens exist
-        #         boi_match = (input_ids == self.boi_token_id).nonzero(as_tuple=False)
-        #         eoi_match = (input_ids == self.eoi_token_id).nonzero(as_tuple=False)
-                
-        #         print(f"  BOI token matches: {boi_match.numel()}")
-        #         print(f"  EOI token matches: {eoi_match.numel()}")
-                
-        #         if boi_match.numel() == 0:
-        #             print(f"  [ROOT CAUSE] BOI token {self.boi_token_id} not found in any sequence!")
-        #             print(f"  input_ids sample: {input_ids[0][:50].tolist()}...")
-                    
-        #         if eoi_match.numel() == 0:
-        #             print(f"  [ROOT CAUSE] EOI token {self.eoi_token_id} not found in any sequence!")
-        #             print(f"  input_ids sample: {input_ids[0][:50].tolist()}...")
-                    
-        #         raise
-
-        #     # Create mask for selecting tokens between BOI and EOI
-        #     batch_size, seq_len = input_ids.shape
-        #     indices = torch.arange(seq_len, device=input_ids.device)[None, :].expand(
-        #         batch_size, -1
-        #     )
-        #     mask = (indices > boi_pos[:, None]) & (indices < eoi_pos[:, None])
-
-        #     prompt_embeds = prompt_embeds[mask].view(
-        #         batch_size, -1, prompt_embeds.size(-1)
-        #     )
-        #     attention_mask = attention_mask[mask].view(batch_size, -1)
-            
-        # elif getattr(self.tokenizer, 'crop_system_tokens', False):
-        #     # QwenImage-style cropping: Remove system tokens and repad
-        #     print(f"[CROP] Applying system token cropping with drop_idx={getattr(self.tokenizer, 'system_tokens_drop_idx', 0)}")
-            
-        #     # Extract valid sequences using attention mask
-        #     hidden_states_list = self._extract_masked_hidden(prompt_embeds, attention_mask)
-            
-        #     # Crop system tokens from the beginning
-        #     cropped_hidden_states = self._crop_system_tokens(
-        #         hidden_states_list, 
-        #         drop_idx=getattr(self.tokenizer, 'system_tokens_drop_idx', 0)
-        #     )
-            
-        #     # Re-pad to maximum length
-        #     prompt_embeds, attention_mask = self._repad_to_max_length(cropped_hidden_states)
-            
-        #     print(f"[CROP] After cropping and repadding: prompt_embeds shape={prompt_embeds.shape}")
-            
-        # # If neither metaqueries nor cropping, use full sequences as-is
-        # # Log connector weights (first layer as example) if connector exists
-        # if self.connector is not None:
-        #     with torch.no_grad():
-        #         for name, param in self.connector.named_parameters():
-        #             print(f"[CONNECTOR WEIGHT] {name} | shape: {param.shape} | mean: {param.data.mean():.6f} | std: {param.data.std():.6f}")
-        
-        # # for i in range(min(3, attention_mask.size(0))):  # Show at most 3 samples
-        # #     print(f"[MASK] attention_mask[{i}] : {attention_mask[i]}")
-        
-        # # Apply connector if it exists, otherwise return raw embeddings
-        # if self.connector is not None:
-        #     return self.connector(prompt_embeds), attention_mask
-        # else:
-        #     print(f"[NO CONNECTOR] Returning raw MLLM embeddings with shape: {prompt_embeds.shape}")
-        #     return prompt_embeds, attention_mask
+    def generation(
+        self, input_ids, attention_mask, pixel_values, image_grid_thw, pixel_values_videos, video_grid_thw, second_per_grid_ts
+    ):
+        if self.mllm_type == "qwenvl":
+            generated_ids = self.mllm_backbone.generate(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                attention_mask=attention_mask,
+                pixel_values_videos=pixel_values_videos,
+                video_grid_thw=video_grid_thw,
+                second_per_grid_ts=second_per_grid_ts,
+                max_new_tokens=1000,
+            )
+            generated_ids_trimmed = [
+                out_ids[len(in_ids) :] for in_ids, out_ids in zip(input_ids, generated_ids)
+            ]
+            output_text = self.tokenizer.batch_decode(
+                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )
+        else:
+            raise ValueError(f"Unsupported model: {self.mllm_type}")
+        return output_text
