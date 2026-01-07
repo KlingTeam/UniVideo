@@ -15,6 +15,7 @@ from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from transformers import PretrainedConfig
 from diffusers.models.autoencoders.autoencoder_kl_hunyuan_video import AutoencoderKLHunyuanVideo
+from diffusers.pipelines.hunyuan_video.pipeline_hunyuan_video import retrieve_timesteps
 from diffusers.utils import BaseOutput
 
 
@@ -299,8 +300,8 @@ class UniVideoPipeline(DiffusionPipeline):
         task: str = "",
         negative_prompt: str = "",
         num_inference_steps: int = 30,  # HunyuanVideo default
-        timesteps: List[int] = None,
-        guidance_scale: float = 6.0,  # HunyuanVideo default
+        sigmas: List[float] = None,
+        guidance_scale: float = 6.0,
         image_guidance_scale: float = 1.5,
         num_images_per_prompt: Optional[int] = 1,
         num_frames: int = 129,  # HunyuanVideo default
@@ -476,7 +477,7 @@ class UniVideoPipeline(DiffusionPipeline):
             print(f"[DEBUG] I2V task, latents.shape: {latents.shape}")
                 
         # Editing task
-        if task == "i2i_edit" or task == "i+i2i_edit" or task == "v2v_edit":
+        if task == "i2i_edit" or task == "i+i2i_edit" or task == "v2v_edit" or task == "i+v2v_edit":
             assert cond_pixel_norm_fchw is not None
             # vit
             if self.univideo_config.mllm_use_cond_pixels:
@@ -530,7 +531,7 @@ class UniVideoPipeline(DiffusionPipeline):
             task_inst = "You will be given an image and a video caption. Your task is to generate a high-quality video that extends the given image into motion while remaining consistent with the caption. Ensure temporal continuity and preserve the color, shape, size, texture, quantity, text, and spatial relationships of all objects and the background: "
         elif task == "multiid":
             task_inst = "You will be provided with multiple reference images and a video caption. Your task is to generate a high-quality video that combines all the subjects from the images into a single coherent scene, consistent with the caption. Use the following text as the caption for the video: "
-        elif task == "v2v_edit":
+        elif task == "v2v_edit" or task == "i+v2v_edit":
             task_inst = "You will be given a video and an editing instruction. Your task is to generate a high-quality video by applying the specified edits, ensuring consistency in visual quality, temporal coherence, and alignment with the instruction: "
         else:
             raise ValueError(f"task: {task} is not support") 
@@ -564,11 +565,13 @@ class UniVideoPipeline(DiffusionPipeline):
         idx_no_cond = (~is_cond).nonzero(as_tuple=False).squeeze(-1)      # [T_keep]
         assert idx_no_cond.numel() > 0, "All f dimension are conditioned"
 
+        # 4. Prepare timesteps
+        sigmas = np.linspace(1.0, 0.0, num_inference_steps + 1)[:-1] if sigmas is None else sigmas
+        timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, sigmas=sigmas)
+
         # 7. Denoising loop
-        timesteps_all = torch.linspace(1.0, 0, num_inference_steps + 1, device=latents.device)
-        timesteps_all = timestep_shift * timesteps_all / (1 - timesteps_all + timestep_shift * timesteps_all)
-        dts = timesteps_all[:-1] - timesteps_all[1:]
-        timesteps = timesteps_all[:-1]
+        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+        self._num_timesteps = len(timesteps)
 
         # TODO: right now can't handle batch szie > 1
         assert batch_size == 1
@@ -576,22 +579,11 @@ class UniVideoPipeline(DiffusionPipeline):
         latents_full = latents
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
-            t0 = time.time()
             for i, t in enumerate(timesteps):
-                guidance_tensor = torch.tensor([6.0], device=device) * 1000.0 # Guidance tensor (HunyuanVideo scales by 1000)
-                current_timestep = t
 
-                if not torch.is_tensor(current_timestep):
-                    is_mps = latents_full.device.type == "mps"
-                    if isinstance(current_timestep, float):
-                        dtype = torch.float32 if is_mps else torch.float64
-                    else:
-                        dtype = torch.int32 if is_mps else torch.int64
-                    current_timestep = torch.tensor([current_timestep], dtype=dtype, device=latents_full.device)
-                elif len(current_timestep.shape) == 0:
-                    current_timestep = current_timestep[None].to(latents_full.device)
-                
-                current_timestep = current_timestep.expand(latents_full.shape[0])
+                self._current_timestep = t
+                guidance_tensor = torch.tensor([6.0], device=device) * 1000.0 # Guidance tensor (HunyuanVideo scales by 1000)
+                current_timestep = t.expand(latents_full.shape[0]).to(latents_full.dtype)
 
                 # 3 pass
                 if guidance_scale > 1.0 and image_guidance_scale > 1.0:
@@ -599,7 +591,7 @@ class UniVideoPipeline(DiffusionPipeline):
                     latents_no_cond = latents_full.index_select(2, idx_no_cond)
                     v_pred_uncond = self.transformer(
                         hidden_states=latents_no_cond,                   # [1,C,T,H,W]
-                        timestep=current_timestep * 999,             # match original scaling
+                        timestep=current_timestep,             # match original scaling
                         encoder_hidden_states=prompt_embeds_uncond,
                         encoder_attention_mask=prompt_attention_mask_uncond,
                         # video_voxel_mask=attention_mask,
@@ -608,7 +600,7 @@ class UniVideoPipeline(DiffusionPipeline):
                     )[0]
                     v_pred_negtxt_vit_vae = self.transformer(
                         hidden_states=latents_full,  
-                        timestep=current_timestep * 999,   
+                        timestep=current_timestep,   
                         encoder_hidden_states=prompt_embeds_negtxt_vit,
                         encoder_attention_mask=prompt_attention_mask_negtxt_vit,
                         # video_voxel_mask=attention_mask,
@@ -618,7 +610,7 @@ class UniVideoPipeline(DiffusionPipeline):
                     v_pred_negtxt_vit_vae = v_pred_negtxt_vit_vae.index_select(2, idx_no_cond)
                     v_pred_txt_vit_vae = self.transformer(
                         hidden_states=latents_full,   # VAE
-                        timestep=current_timestep * 999, 
+                        timestep=current_timestep, 
                         encoder_hidden_states=prompt_embeds_txt_vit,
                         encoder_attention_mask=prompt_attention_mask_txt_vit,
                         # video_voxel_mask=attention_mask,
@@ -635,7 +627,7 @@ class UniVideoPipeline(DiffusionPipeline):
                     print(f"[DEBUG] 2 pass")
                     v_pred_negtxt_vit_vae = self.transformer(
                         hidden_states=latents_full,                   # [1,C,T,H,W]
-                        timestep=current_timestep * 999,             # match original scaling
+                        timestep=current_timestep,             # match original scaling
                         encoder_hidden_states=prompt_embeds_negtxt_vit,
                         encoder_attention_mask=prompt_attention_mask_negtxt_vit,
                         # video_voxel_mask=attention_mask,
@@ -645,7 +637,7 @@ class UniVideoPipeline(DiffusionPipeline):
                     v_pred_negtxt_vit_vae = v_pred_negtxt_vit_vae.index_select(2, idx_no_cond)
                     v_pred_txt_vit_vae = self.transformer(
                         hidden_states=latents_full,                   # [1,C,T,H,W]
-                        timestep=current_timestep * 999,             # match original scaling
+                        timestep=current_timestep,             # match original scaling
                         encoder_hidden_states=prompt_embeds_txt_vit,
                         encoder_attention_mask=prompt_attention_mask_txt_vit,
                         # video_voxel_mask=attention_mask,
@@ -657,22 +649,15 @@ class UniVideoPipeline(DiffusionPipeline):
                 else:
                     raise ValueError(f"guidance_scale: {guidance_scale} and image_guidance_scale:{image_guidance_scale} is not support") 
 
-                # compute previous image: x_t -> x_t-1
+                # compute the previous noisy sample x_t -> x_t-1
                 latents_no_cond = latents_full.index_select(2, idx_no_cond)            # [B,C,T_keep,H,W]
                 print(f"latents_full.shape:{latents_full.shape}")
                 print(f"v_pred.shape:{v_pred.shape}")
-                print(f"dts[i]:{dts[i]}")
-                latents_no_cond = latents_no_cond - dts[i] * v_pred
+                latents_no_cond = self.scheduler.step(v_pred, t, latents_no_cond, return_dict=False)[0]
 
                 # call the callback, if provided
-                if i == len(timesteps) - 1 or ((i + 1) % self.scheduler.order == 0):
+                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
-                    if callback is not None and i % callback_steps == 0:
-                        step_idx = i // getattr(self.scheduler, "order", 1)
-                        callback(step_idx, t, latents_no_cond)
-
-                if process_call_back:
-                    process_call_back((i + 1) / len(timesteps), (time.time() - t0) / (i + 1) * (len(timesteps) - i - 1))
 
                 # Reset the latents full from origin
                 latents_full = latents_full_origin.clone()
@@ -686,6 +671,9 @@ class UniVideoPipeline(DiffusionPipeline):
 
         latents_no_cond = latents_full.index_select(2, idx_no_cond)
         latents = latents_no_cond
+
+        self._current_timestep = None
+        
         if not output_type == "latent":
             latents = latents.to(self.vae.dtype) / self.vae.config.scaling_factor
             video = self.vae.decode(latents, return_dict=False)[0]

@@ -52,6 +52,8 @@ We provide two UniVideo checkpoint variants:
 
 ### 3. Inference
 
+We provide inference scripts for running UniVideo on demo inputs for each task:
+
 #### Univideo variant 1 
 ```
 cd univideo
@@ -62,6 +64,7 @@ python univideo_inference.py --task t2i           --config configs/univideo_qwen
 python univideo_inference.py --task i2i_edit      --config configs/univideo_qwen2p5vl7b_hidden_hunyuanvideo.yaml
 python univideo_inference.py --task i2v           --config configs/univideo_qwen2p5vl7b_hidden_hunyuanvideo.yaml
 python univideo_inference.py --task v2v_edit      --config configs/univideo_qwen2p5vl7b_hidden_hunyuanvideo.yaml
+python univideo_inference.py --task i+v2v_edit    --config configs/univideo_qwen2p5vl7b_hidden_hunyuanvideo.yaml
 ```
 
 #### Univideo variant 2 
@@ -74,8 +77,15 @@ python univideo_inference.py --task t2i           --config configs/univideo_qwen
 python univideo_inference.py --task i2i_edit      --config configs/univideo_qwen2p5vl7b_queries_hunyuanvideo.yaml
 python univideo_inference.py --task i2v           --config configs/univideo_qwen2p5vl7b_queries_hunyuanvideo.yaml
 python univideo_inference.py --task v2v_edit      --config configs/univideo_qwen2p5vl7b_queries_hunyuanvideo.yaml
+python univideo_inference.py --task i+v2v_edit    --config configs/univideo_qwen2p5vl7b_queries_hunyuanvideo.yaml
 ```
 
+
+## Acknowledgement
+
+- [HunyuanVideo](https://github.com/Tencent-Hunyuan/HunyuanVideo): the base video generation model used in this work. Thanks to the authors for their excellent contribution.
+- [Qwen2.5-VL](https://github.com/QwenLM): the base vlm model used in this work. Thanks to the authors for their excellent contribution.
+- [MetaQueries](https://xichenpan.com/metaquery/): we adopt their query implementation. Thanks to the authors for their excellent contribution.
 
 ## Citation
 

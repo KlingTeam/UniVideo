@@ -97,8 +97,8 @@ class MLLMInContext(PreTrainedModel):
             print(f"Using Qwen MLLM {config.mllm_id}")
             self.mllm_backbone = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 config.mllm_id, 
-                # attn_implementation="sdpa", 
-                attn_implementation="flash_attention_2", 
+                attn_implementation="sdpa", 
+                # attn_implementation="flash_attention_2", 
                 torch_dtype=torch.bfloat16
             )
             # self.mllm_backbone.model.config.use_sliding_window = False

@@ -12,3 +12,5 @@ accelerate==1.5.1
 safetensors==0.5.3
 imageio
 imageio-ffmpeg
+opencv-python-headless
+decord>=0.6.0

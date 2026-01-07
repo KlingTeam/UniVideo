@@ -1,7 +1,10 @@
+import os
 from huggingface_hub import snapshot_download
 
-# last layer hidden version
 local_dir = "ckpts"
+os.makedirs(local_dir, exist_ok=True)
+
+# last layer hidden version
 snapshot_download(
     repo_id="KlingTeam/UniVideo",
     repo_type="model",
@@ -9,7 +12,7 @@ snapshot_download(
     local_dir=local_dir,
     local_dir_use_symlinks=False,
 )
-print(f"Downloading univideo_qwen2p5vl7b_hidden_hunyuanvideo ckpt to {local_dir}")
+print(f"Downloaded univideo_qwen2p5vl7b_hidden_hunyuanvideo ckpt to {local_dir}")
 
 
 # queries version
@@ -21,4 +24,4 @@ snapshot_download(
     local_dir=local_dir,
     local_dir_use_symlinks=False,
 )
-print(f"Downloading univideo_qwen2p5vl7b_queries_hunyuanvideo ckpt to {local_dir}")
+print(f"Downloaded univideo_qwen2p5vl7b_queries_hunyuanvideo ckpt to {local_dir}")

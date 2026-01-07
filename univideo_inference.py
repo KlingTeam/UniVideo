@@ -20,7 +20,7 @@ def parse_args():
     p.add_argument(
         "--task",
         type=str,
-        choices=["understanding", "multiid", "t2v", "t2i", "i2i_edit", "i+i2i_edit", "i2v", "v2v_edit"],
+        choices=["understanding", "multiid", "t2v", "t2i", "i2i_edit", "i+i2i_edit", "i2v", "i+v2v_edit", "v2v_edit"],
         required=True,
         help="Generation task",
     )
@@ -175,10 +175,10 @@ def main():
 
 
     # in context v2v editing
-    elif args.task == "v2v_edit":
-        ref_image_path_list = ["demo/in-context-video-editing/ID.jpeg"]
+    elif args.task == "i+v2v_edit":
+        ref_image_path_list = ["demo/in-context-v2v/id_swap/ID.jpeg"]
         ref_images_pil_list = [[pad_image_pil_to_square(Image.open(p).convert("RGB")) for p in ref_image_path_list]]
-        cond_video_path = "demo/in-context-video-editing/origin.mp4"
+        cond_video_path = "demo/in-context-v2v/id_swap/origin.mp4"
         prompt = "Use the man's face in the reference image to replace the man's face in the video."
         pipeline_kwargs = dict(
             prompts=[prompt],
@@ -195,7 +195,27 @@ def main():
             timestep_shift=7.0,
             task=args.task,
         )
-        output_path = "demo/in-context-video-editing/output.mp4"
+        output_path = "demo/in-context-v2v/id_swap/output.mp4"
+
+    # free form v2v editing
+    elif args.task == "v2v_edit":
+        cond_video_path = "demo/v2v_edit/video.mp4"
+        prompt = "Change the man to look like he is sculpted from chocolate."
+        pipeline_kwargs = dict(
+            prompts=[prompt],
+            negative_prompt=negative_prompt,
+            cond_video_path=cond_video_path,
+            height=480,
+            width=854,
+            num_frames=129,
+            num_inference_steps=50,
+            guidance_scale=7.0,
+            image_guidance_scale=2.0,
+            seed=42,
+            timestep_shift=7.0,
+            task=args.task,
+        )
+        output_path = "demo/v2v_edit/output.mp4"
 
     # i2v
     elif args.task == "i2v":
