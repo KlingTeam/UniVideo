@@ -1,21 +1,42 @@
-# UniVideo: Unified Understanding, Generation, and Editing for Videos
+<p align="center" >
+    <img src="assets/teaser.gif"  width="50%" >
+</p>
+
+# <div align="center" >UniVideo: Unified Understanding, Generation, and Editing for Videos<div align="center">
+
+
+<div align="center">
+
+**[Cong Wei<sup>*,1,2</sup>](https://congwei1230.github.io/) &ensp;
+[Quande Liu<sup>†,2</sup>](https://liuquande.github.io/) &ensp;
+[Zixuan Ye<sup>2</sup>](https://openreview.net/profile?id=~Zixuan_Ye1) &ensp; 
+[Qiulin Wang<sup>2</sup>](https://scholar.google.com/citations?user=3vvZdy8AAAAJ&hl=en) &ensp;
+[Xintao Wang<sup>2</sup>](https://xinntao.github.io/) &ensp;
+[Pengfei Wan<sup>2</sup>](https://magicwpf.github.io/) &ensp;
+[Kun Gai<sup>2</sup>](https://openreview.net/profile?id=~Kun_Gai1) &ensp;
+[Wenhu Chen<sup>†,1</sup>](https://wenhuchen.github.io/)**
+  <p>
+    <sup>1</sup>University of Waterloo &nbsp;&nbsp;
+    <sup>2</sup>Kling Team, Kuaishou Technology<br>
+    <sup>*</sup>Work done during an internship at Kling Team, Kuaishou Technology
+    <sup>†</sup>Corresponding author
+  </p>
+</div>
 
 <p align="center">
-  <img src="assets/image.png" width="50%">
+  <a href='https://congwei1230.github.io/UniVideo/'><img src='https://img.shields.io/badge/Project-Page-Green'></a>
+  &nbsp;
+  <a href="https://arxiv.org/abs/2510.08377"><img src="https://img.shields.io/static/v1?label=Arxiv&message=UniVideo&color=red&logo=arxiv"></a>
+  &nbsp;
+  <a href='https://huggingface.co/KlingTeam/UniVideo'><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model-orange'></a>
 </p>
 
 
-<a href='https://arxiv.org/abs/2510.08377'><img src='https://img.shields.io/badge/ArXiv-2510.08555-red'></a> 
-<a href='https://congwei1230.github.io/UniVideo/#'><img src='https://img.shields.io/badge/Project-Page-Green'></a>
 
-[Cong Wei<sup></sup>](https://congwei1230.github.io/) &emsp;
-[Quande Liu<sup>†</sup>](https://liuquande.github.io/) &emsp;
-[Zixuan Ye<sup></sup>](https://openreview.net/profile?id=~Zixuan_Ye1) &emsp; 
-[Qiulin Wang<sup></sup>](https://scholar.google.com/citations?user=3vvZdy8AAAAJ&hl=en) &emsp;
-[Xintao Wang<sup></sup>](https://xinntao.github.io/) &emsp;
-[Pengfei Wan<sup></sup>](https://magicwpf.github.io/) &emsp;
-[Kun Gai<sup></sup>](https://openreview.net/profile?id=~Kun_Gai1") &emsp;
-[Wenhu Chen<sup>†</sup>](https://wenhuchen.github.io/)
+## 🔔News
+
+- [2026-01-07]: Released [Code](https://github.com/KlingTeam/UniVideo) and [Model](https://huggingface.co/KlingTeam/UniVideo).
+- [2025-10-09]: Released [Arxiv Preprint](https://arxiv.org/abs/2510.08377) and the [Project Page](https://congwei1230.github.io/UniVideo/)
 
 
 
@@ -42,7 +63,7 @@ Download the [Univideo checkpoint](https://huggingface.co/KlingTeam/UniVideo) to
 python download_ckpt.py
 ```
 
-We provide two UniVideo checkpoint variants:
+We provide two UniVideo checkpoint variants as described in Arxiv Preprint Section 3.2:
 
 - **Variant 1 (img, video, txt -> mllm -> last layer hidden -> mmdit)**  
   Image, video, and text inputs are processed by the MLLM, and the final hidden states are fed into the MMDiT backbone.
@@ -87,7 +108,7 @@ python univideo_inference.py --task i+v2v_edit    --config configs/univideo_qwen
 - [Qwen2.5-VL](https://github.com/QwenLM): the base vlm model used in this work. Thanks to the authors for their excellent contribution.
 - [MetaQueries](https://xichenpan.com/metaquery/): we adopt their query implementation. Thanks to the authors for their excellent contribution.
 
-## Citation
+## 🌟 Citation
 
 If you find UniVideo useful for your research and applications, please cite using this BibTeX:
 
