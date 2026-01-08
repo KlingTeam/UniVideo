@@ -11,8 +11,9 @@
 [Quande Liu<sup>†,2</sup>](https://liuquande.github.io/) &ensp;
 [Zixuan Ye<sup>2</sup>](https://openreview.net/profile?id=~Zixuan_Ye1) &ensp; 
 [Qiulin Wang<sup>2</sup>](https://scholar.google.com/citations?user=3vvZdy8AAAAJ&hl=en) &ensp;
-[Xintao Wang<sup>2</sup>](https://xinntao.github.io/) &ensp;
-[Pengfei Wan<sup>2</sup>](https://magicwpf.github.io/) &ensp;
+[Xintao Wang<sup>2</sup>](https://xinntao.github.io/)**
+
+**[Pengfei Wan<sup>2</sup>](https://magicwpf.github.io/) &ensp;
 [Kun Gai<sup>2</sup>](https://openreview.net/profile?id=~Kun_Gai1) &ensp;
 [Wenhu Chen<sup>†,1</sup>](https://wenhuchen.github.io/)**
   <p>
