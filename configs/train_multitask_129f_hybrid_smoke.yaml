@@ -1,0 +1,53 @@
+config: configs/univideo_qwen2p5vl7b_hidden_hunyuanvideo.yaml
+output_dir: outputs/univideo-multitask-129f-hybrid-smoke
+
+height: 160
+width: 288
+num_frames: 129
+train_datasets:
+  - name: ditto-v2v
+    jsonl: data/ditto_100_v2v.jsonl
+    height: 160
+    width: 288
+    num_frames: 129
+  - name: opens2v-multiid
+    jsonl: data/opens2v_multiid_smoke.jsonl
+    height: 160
+    width: 288
+    num_frames: 129
+  - name: pico-banana-i2i
+    jsonl: data/pico_banana_i2i_smoke.jsonl
+    height: 256
+    width: 256
+    num_frames: 1
+  - name: kiwi-refvie-i-v2v
+    jsonl: data/kiwi_refvie_i_v2v_smoke.jsonl
+    height: 160
+    width: 288
+    num_frames: 129
+dataloader_num_workers: 0
+prefetch_factor: 2
+
+max_train_steps: 8
+batch_size: 1
+optimizer: adamw
+use_fsdp: true
+fsdp_sharding_strategy: HYBRID_SHARD
+fsdp_num_shard: 8
+fsdp_num_replicate: 1
+fsdp_backward_prefetch: BACKWARD_PRE
+fsdp_cpu_offload: false
+learning_rate: 1.0e-5
+weight_decay: 0.0
+max_grad_norm: 1.0
+log_every: 1
+save_every: 8
+seed: 42
+
+train_mllm: false
+train_vae: false
+train_transformer_patterns: ""
+gradient_checkpointing: true
+quiet_mllm: true
+dtype: bf16
+guidance_scale: 6.0

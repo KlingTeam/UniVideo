@@ -16,4 +16,10 @@ pipeline_config:
     mllm_use_cond_pixels: true
     mllm_cond_video_num_frames: 2
     timestep_shift: 7
+    epsilon: 1.0e-3
+    logit_normal: true
+    match_snr: false
+    p_drop_vit: 0.1
+    p_drop_vae: 0.1
+    p_drop_text: 0.1
 transformer_ckpt_path: ckpts/univideo_qwen2p5vl7b_hidden_hunyuanvideo/model.ckpt

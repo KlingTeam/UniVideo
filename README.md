@@ -237,7 +237,7 @@ pip install -r requirements.txt
 Download the [Univideo checkpoint](https://huggingface.co/KlingTeam/UniVideo) to a local path for example `ckpts/`:
 
 ```
-python download_ckpt.py
+python download_ckpt.py --variant hidden
 ```
 
 We provide two UniVideo checkpoint variants as described in Arxiv Preprint Section 3.2:
@@ -247,6 +247,18 @@ We provide two UniVideo checkpoint variants as described in Arxiv Preprint Secti
 
 - **Variant 2 (img, video, txt, queries -> mllm -> txt + queries last layer hidden -> mmdit)**  
   Image, video, text, and queries are processed by the MLLM. The final hidden states of text and queries are used as inputs to MMDiT.
+
+Download the queries-based checkpoint with:
+
+```
+python download_ckpt.py --variant queries
+```
+
+Or download both variants without deleting either local directory:
+
+```
+python download_ckpt.py --variant all
+```
 
 ### 3. Inference
 
@@ -298,6 +310,22 @@ python univideo_inference.py --demo_task in_context_video_edit_swap --config con
 python univideo_inference.py --demo_task in_context_video_edit_style --config configs/univideo_qwen2p5vl7b_hidden_hunyuanvideo.yaml
 ```
 
+#### 4. Multi-GPU README Sweep
+
+To run the README demo tasks across multiple local GPUs while keeping each
+task's default hyperparameters, use:
+
+```bash
+python scripts/run_readme_inference_sweep.py \
+  --gpus 0,1,2 \
+  --max-parallel 3 \
+  --config configs/univideo_qwen2p5vl7b_hidden_hunyuanvideo.yaml \
+  --output-root outputs/readme-inference
+```
+
+The launcher writes one log per task under `outputs/readme-inference/logs`.
+Lower `--max-parallel` if checkpoint loading saturates local storage.
+
 #### Univideo variant 2
 To use the **Queries-based** version of UniVideo, simply update the configuration flag.
 ```
@@ -305,7 +333,23 @@ To use the **Queries-based** version of UniVideo, simply update the configuratio
 ```
 
 
-### 4. Evaluation
+### 4. Training
+
+We provide an example training setting using open-source data so users can run a
+small training job and verify the training pipeline. See
+[TRAINING.md](TRAINING.md) for the data schema, dataset preparation details,
+and full training options.
+
+```bash
+python download_ckpt.py --variant hidden
+python -m pip install --target .deps/pyarrow pyarrow
+bash scripts/prepare_smoke_data.sh
+torchrun --standalone --nproc_per_node 8 \
+  train/train_univideo.py configs/train_multitask_129f_hybrid_smoke.yaml
+```
+
+
+### 5. Evaluation
 
 We provide the scripts for evaluating UniVideo on GenEval, ImgEdit, GEdit and Vbench benchmarks.  Check out [EVAL.md](EVAL.md)
 

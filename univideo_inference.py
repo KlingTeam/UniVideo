@@ -41,6 +41,12 @@ def parse_args():
         default="configs/univideo_qwen2p5vl7b_hidden_hunyuanvideo.yaml",
         help="Path to yaml config file",
     )
+    p.add_argument(
+        "--output-root",
+        type=str,
+        default=None,
+        help="Optional directory for demo outputs. Keeps task hyperparameters unchanged.",
+    )
     return p.parse_args()
 
 
@@ -177,7 +183,7 @@ def main():
         output_path = "demo/image_edit/output.jpg"
 
     # in context image editing
-    elif args.demo_task == "in_context_image_edit_swap":
+    elif args.demo_task == "in_context_image_edit":
         ref_image_path_list = ["demo/in_context_image_edit/id.jpeg"]
         ref_images_pil_list = [[pad_image_pil_to_square(Image.open(p).convert("RGB")) for p in ref_image_path_list]]
         cond_image_path = "demo/in_context_image_edit/input.jpg"
@@ -392,6 +398,10 @@ def main():
         F, H, W, C = output.shape
         assert C == 3, f"Expected RGB, got C={C}"
         # ---------- image ----------
+        if args.output_root is not None:
+            output_path = os.path.join(args.output_root, args.demo_task, os.path.basename(output_path))
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
         if F == 1:
             img = output[0]  # (H, W, C)
             # normalize if needed

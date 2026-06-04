@@ -1,7 +1,10 @@
 import time
+import os
+from contextlib import ExitStack, redirect_stdout
 from dataclasses import dataclass
 from typing import Optional, List
 import torch
+import torch.nn.functional as F
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union, Literal
 import numpy as np
 import torch
@@ -57,6 +60,12 @@ class UniVideoPipelineConfig(PretrainedConfig):
         mllm_use_cond_pixels: bool = False,
         mllm_cond_video_num_frames: int = 8,
         timestep_shift: float = 1.0,
+        epsilon: float = 1e-3,
+        p_drop_text: float = 0.1,
+        p_drop_vit: float = 0.1,
+        p_drop_vae: float = 0.1,
+        logit_normal: bool = True,
+        match_snr: bool = False,
         hunyuan_model_id: str = "hunyuanvideo-community/HunyuanVideo",
         enable_gradient_checkpointing: bool = True,
         **kwargs,
@@ -66,6 +75,12 @@ class UniVideoPipelineConfig(PretrainedConfig):
         self.mllm_use_cond_pixels = mllm_use_cond_pixels
         self.mllm_cond_video_num_frames = mllm_cond_video_num_frames
         self.timestep_shift = timestep_shift
+        self.epsilon = epsilon
+        self.p_drop_text = p_drop_text
+        self.p_drop_vit = p_drop_vit
+        self.p_drop_vae = p_drop_vae
+        self.logit_normal = logit_normal
+        self.match_snr = match_snr
         self.enable_gradient_checkpointing = enable_gradient_checkpointing
         self.hunyuan_model_id = hunyuan_model_id
 
@@ -105,6 +120,320 @@ class UniVideoPipeline(DiffusionPipeline):
         self.vae_scale_factor_spatial = self.vae.spatial_compression_ratio if getattr(self, "vae", None) else 8
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
         self.vae_transforms = torch.jit.script(transforms.Normalize([127.5], [127.5]))
+
+    @staticmethod
+    def _batch_get(batch, key, default=None):
+        if isinstance(batch, dict):
+            return batch.get(key, default)
+        return getattr(batch, key, default)
+
+    @staticmethod
+    def _module_device(module) -> torch.device:
+        inner = module.module if hasattr(module, "module") else module
+        return next(inner.parameters()).device
+
+    @staticmethod
+    def _module_dtype(module) -> torch.dtype:
+        inner = module.module if hasattr(module, "module") else module
+        return next(inner.parameters()).dtype
+
+    def _init_mllm_visual_inputs(self):
+        if self.univideo_config.mllm_use_ref_img or self.univideo_config.mllm_use_cond_pixels:
+            return [], []
+        return None, None
+
+    def _add_cond_image_to_mllm_inputs(self, mllm_input_imgs, cond_img_pil):
+        if not self.univideo_config.mllm_use_cond_pixels or cond_img_pil is None:
+            return mllm_input_imgs
+        if mllm_input_imgs is None:
+            return None
+        if len(mllm_input_imgs) > 0:
+            mllm_input_imgs[0].append(cond_img_pil)
+        else:
+            mllm_input_imgs = [[cond_img_pil]]
+        return mllm_input_imgs
+
+    def _add_cond_video_to_mllm_inputs(self, mllm_input_videos, cond_frames_uint8_fhwc):
+        if not self.univideo_config.mllm_use_cond_pixels or cond_frames_uint8_fhwc is None:
+            return mllm_input_videos
+        if mllm_input_videos is None:
+            return None
+        total = cond_frames_uint8_fhwc.shape[0]
+        steps = min(total, self.univideo_config.mllm_cond_video_num_frames)
+        idx = torch.linspace(0, total - 1, steps=steps, device=cond_frames_uint8_fhwc.device).round().long()
+        cond_frames_uint8_fhwc = cond_frames_uint8_fhwc.index_select(0, idx)
+        if cond_frames_uint8_fhwc.shape[0] > 0:
+            mllm_input_videos = [[cond_frames_uint8_fhwc]]
+        return mllm_input_videos
+
+    def _prefix_task_prompt(self, task: str, prompts: List[str]) -> List[str]:
+        return [self._task_instruction(task) + prompt for prompt in prompts]
+
+    def _training_match_pixel_hw(self, pixels: torch.Tensor, target_hw: Tuple[int, int]) -> torch.Tensor:
+        if pixels.shape[-2:] == target_hw:
+            return pixels
+        return F.interpolate(pixels, size=target_hw, mode="bilinear", align_corners=False)
+
+    def _training_pixels_to_latents(self, pixels: torch.Tensor) -> torch.Tensor:
+        if pixels.ndim != 4:
+            raise ValueError(f"Expected pixels as [F,C,H,W], got {tuple(pixels.shape)}")
+        video = pixels.unsqueeze(0).to(device=self.vae.device, dtype=self.vae.dtype)
+        video = rearrange(video, "b f c h w -> b c f h w")
+        latents = self.vae.encode(video).latent_dist.sample()
+        return latents * self.vae.config.scaling_factor
+
+    def _training_encode_ref_latents(
+        self,
+        ref_pixels: Optional[List[torch.Tensor]],
+        target_hw: Tuple[int, int],
+    ) -> Optional[torch.Tensor]:
+        if not ref_pixels:
+            return None
+        latents = [
+            self._training_pixels_to_latents(self._training_match_pixel_hw(pixels, target_hw))
+            for pixels in ref_pixels
+        ]
+        return torch.cat(latents, dim=2)
+
+    def _training_encode_mllm_condition(
+        self,
+        prompts: List[str],
+        images=None,
+        videos=None,
+        train_mllm: bool = False,
+        quiet_mllm: bool = True,
+    ):
+        tokenize_fn = self.mllm_encoder.get_tokenize_fn()
+        tokenizer = self.mllm_encoder.get_tokenizer()
+        grad_context = torch.enable_grad() if train_mllm else torch.no_grad()
+        device = self._module_device(self.mllm_encoder)
+        dtype = self._module_dtype(self.transformer)
+        with ExitStack() as stack:
+            stack.enter_context(grad_context)
+            if quiet_mllm:
+                devnull = stack.enter_context(open(os.devnull, "w"))
+                stack.enter_context(redirect_stdout(devnull))
+            tokenized = tokenize_fn(tokenizer, prompts, images=images, videos=videos)
+            inputs = {
+                key: value.to(device) if isinstance(value, torch.Tensor) else value
+                for key, value in tokenized.items()
+            }
+            prompt_embeds, prompt_attention_mask = self.mllm_encoder.encode_condition(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                pixel_values=inputs.get("pixel_values"),
+                image_grid_thw=inputs.get("image_grid_thw"),
+                pixel_values_videos=inputs.get("pixel_values_videos"),
+                video_grid_thw=inputs.get("video_grid_thw"),
+                second_per_grid_ts=inputs.get("second_per_grid_ts"),
+            )
+        return prompt_embeds.to(dtype=dtype), prompt_attention_mask
+
+    def _training_build_noisy_latents(
+        self,
+        latents: torch.Tensor,
+        is_cond: torch.Tensor,
+        batch_size: int,
+        t_step: Optional[torch.Tensor] = None,
+    ):
+        idx_no_cond = (~is_cond).nonzero(as_tuple=False).squeeze(-1)
+        if idx_no_cond.numel() == 0:
+            raise ValueError("All frames are conditioned; nothing to train.")
+
+        latents_no_cond = latents.index_select(2, idx_no_cond)
+        z_1 = torch.randn_like(latents_no_cond)
+        eps = self.univideo_config.epsilon
+
+        if t_step is not None:
+            t = t_step.repeat_interleave(batch_size).to(device=latents_no_cond.device, dtype=latents_no_cond.dtype)
+        elif self.univideo_config.logit_normal:
+            t_logit = torch.exp(torch.randn(batch_size, device=latents_no_cond.device))
+            t = t_logit / (t_logit + 1)
+        else:
+            t = torch.rand(batch_size, device=latents_no_cond.device, dtype=latents_no_cond.dtype)
+
+        t = self.univideo_config.timestep_shift * t / (1 - t + self.univideo_config.timestep_shift * t)
+        timestep = t
+        if self.univideo_config.match_snr:
+            scale_factor = latents_no_cond.shape[2] ** 0.5
+            t = scale_factor * t / (1 - t + scale_factor * t)
+
+        t_expand = t[:, None, None, None, None]
+        z_t = (1 - t_expand) * latents_no_cond + (eps + (1 - eps) * t_expand) * z_1
+        u = (1 - eps) * z_1 - latents_no_cond
+
+        z_t_full = latents.clone()
+        z_t_full.index_copy_(2, idx_no_cond, z_t.to(latents.dtype))
+        return z_t_full, u.to(latents.dtype), idx_no_cond, timestep
+
+    def compute_loss(self, result_dict, mask=None):
+        pred, target = result_dict["pred"], result_dict["target"]
+        if mask is None:
+            loss = F.mse_loss(pred.float(), target.float())
+            return {"loss": loss}
+
+        if not (pred.shape[0] == mask.shape[0] and pred.shape[2:] == mask.shape[2:]):
+            raise AssertionError(f"mask b 1 f h w, pred.shape:{pred.shape}, mask.shape:{mask.shape}")
+        mask = mask.to(dtype=pred.dtype)
+        loss = F.mse_loss(pred * mask, target * mask, reduction="sum")
+        loss = loss / mask.expand_as(pred).sum().clamp_min(1.0)
+        return {"loss": loss}
+
+    def training_forward(
+        self,
+        batch,
+        train_mllm: bool = False,
+        train_vae: bool = False,
+        quiet_mllm: bool = True,
+        guidance_scale: float = 6.0,
+    ) -> Dict[str, torch.Tensor]:
+        """One UniVideo training step forward.
+
+        Expected batch fields match `UniVideoSample`:
+        task, prompt, target_pixels, cond_pixels, ref_pixels, ref_image_pils,
+        cond_image_pil, cond_video_uint8.
+        """
+        task = self._batch_get(batch, "task")
+        target_pixels = self._batch_get(batch, "target_pixels")
+        cond_pixels = self._batch_get(batch, "cond_pixels")
+        ref_pixels = self._batch_get(batch, "ref_pixels")
+        prompt = self._batch_get(batch, "prompt")
+        if isinstance(prompt, str):
+            prompts = [prompt]
+        else:
+            prompts = prompt
+
+        target_hw = target_pixels.shape[-2:]
+        vae_context = torch.enable_grad() if train_vae else torch.no_grad()
+        with vae_context:
+            target_latents = self._training_pixels_to_latents(target_pixels)
+            batch_size, _, latent_t, latent_h, latent_w = target_latents.shape
+            attention_mask = torch.ones_like(target_latents[:, :1], dtype=target_latents.dtype)
+            loss_mask = torch.ones_like(target_latents[:, :1], dtype=target_latents.dtype)
+            is_cond = torch.zeros(latent_t, dtype=torch.bool, device=target_latents.device)
+
+            latents = target_latents
+            cond_latents = (
+                self._training_pixels_to_latents(self._training_match_pixel_hw(cond_pixels, target_hw))
+                if cond_pixels is not None
+                else None
+            )
+            ref_latents = self._training_encode_ref_latents(ref_pixels, target_hw)
+
+        if ref_latents is not None:
+            ref_mask = torch.ones_like(ref_latents[:, :1], dtype=attention_mask.dtype)
+            latents = torch.cat([ref_latents, latents], dim=2)
+            attention_mask = torch.cat([ref_mask, attention_mask], dim=2)
+            loss_mask = torch.cat([torch.zeros_like(ref_mask), loss_mask], dim=2)
+            is_cond = torch.cat([torch.ones(ref_latents.shape[2], dtype=torch.bool, device=latents.device), is_cond], dim=0)
+
+        if cond_latents is not None:
+            cond_mask = torch.ones_like(cond_latents[:, :1], dtype=attention_mask.dtype)
+            if task == "i2v":
+                start = ref_latents.shape[2] if ref_latents is not None else 0
+                frames = min(latents.shape[2] - start, cond_latents.shape[2])
+                latents = latents.clone()
+                latents[:, :, start : start + frames] = cond_latents[:, :, :frames]
+                loss_mask[:, :, start : start + frames] = 0
+                is_cond[start : start + frames] = True
+            else:
+                latents = torch.cat([latents, cond_latents], dim=2)
+                attention_mask = torch.cat([attention_mask, cond_mask], dim=2)
+                loss_mask = torch.cat([loss_mask, torch.zeros_like(cond_mask)], dim=2)
+                is_cond = torch.cat([is_cond, torch.ones(cond_latents.shape[2], dtype=torch.bool, device=latents.device)], dim=0)
+
+        if not torch.all(attention_mask == 1):
+            raise ValueError("Training attention_mask is expected to be all ones.")
+
+        prompts = self._prefix_task_prompt(task, prompts)
+
+        drop_vit = torch.rand(1).item() < self.univideo_config.p_drop_vit
+        drop_vae = torch.rand(1).item() < self.univideo_config.p_drop_vae
+        drop_text = torch.rand(1).item() < self.univideo_config.p_drop_text
+        if drop_text:
+            prompts = [""] * len(prompts)
+
+        z_t_full, velocity_target, idx_no_cond, timestep = self._training_build_noisy_latents(
+            latents=latents,
+            is_cond=is_cond,
+            batch_size=batch_size,
+            t_step=self._batch_get(batch, "t_step"),
+        )
+        if drop_vae:
+            z_t_full = z_t_full.index_select(2, idx_no_cond)
+
+        mllm_images, mllm_videos = self._init_mllm_visual_inputs()
+
+        ref_image_pils = self._batch_get(batch, "ref_image_pils")
+        if ref_image_pils is not None and self.univideo_config.mllm_use_ref_img:
+            mllm_images = [list(ref_image_pils)]
+
+        cond_image_pil = self._batch_get(batch, "cond_image_pil")
+        cond_video_uint8 = self._batch_get(batch, "cond_video_uint8")
+        mllm_images = self._add_cond_image_to_mllm_inputs(mllm_images, cond_image_pil)
+        mllm_videos = self._add_cond_video_to_mllm_inputs(mllm_videos, cond_video_uint8)
+
+        if drop_vit:
+            mllm_images = None
+            mllm_videos = None
+        prompt_embeds, prompt_attention_mask = self._training_encode_mllm_condition(
+            prompts=prompts,
+            images=mllm_images if mllm_images else None,
+            videos=mllm_videos if mllm_videos else None,
+            train_mllm=train_mllm,
+            quiet_mllm=quiet_mllm,
+        )
+
+        guidance = torch.full(
+            (batch_size,),
+            guidance_scale * 1000.0,
+            device=latents.device,
+            dtype=latents.dtype,
+        )
+
+        pred = self.transformer(
+            hidden_states=z_t_full,
+            timestep=timestep * 999,
+            encoder_hidden_states=prompt_embeds,
+            encoder_attention_mask=prompt_attention_mask,
+            guidance=guidance,
+            return_dict=False,
+        )[0]
+        if drop_vae:
+            pred_target = pred
+            mask = torch.ones_like(velocity_target[:, :1], dtype=pred_target.dtype)
+        else:
+            pred_target = pred.index_select(2, idx_no_cond)
+            mask = loss_mask.index_select(2, idx_no_cond).to(pred_target.dtype)
+        loss_dict = self.compute_loss({"pred": pred_target, "target": velocity_target}, mask=mask)
+
+        return {
+            "loss": loss_dict["loss"],
+            "pred": pred_target,
+            "target": velocity_target,
+            "loss_mask": mask,
+            "timestep": timestep.detach(),
+        }
+
+    forward = training_forward
+
+    @staticmethod
+    def _task_instruction(task: str) -> str:
+        if task == "t2v":
+            return "You will be given a video caption. Your task is to generate a high quality video that accurately reflects the caption. Focus specifically on the color, shape, size, texture, quantity, text, spatial relationships and motion of all objects and the background: "
+        if task == "i2i_edit":
+            return "You will be given an image and an editing instruction. Your task is to generate a high-quality image by applying the specified edits, ensuring consistency in visual quality and alignment with the instruction: "
+        if task == "i+i2i_edit":
+            return "You will be given a reference image, an image to be modified, and an editing instruction. Your task is to generate a high-quality image by applying the specified edits, ensuring consistency with the reference image and alignment with the instruction: "
+        if task == "t2i":
+            return "You will be given an image caption. Your task is to generate a high quality image that accurately reflects the caption. Focus specifically on the color, shape, size, texture, quantity, text, and spatial relationships of all objects and the background: "
+        if task == "i2v":
+            return "You will be given an image and a video caption. Your task is to generate a high-quality video that extends the given image into motion while remaining consistent with the caption. Ensure temporal continuity and preserve the color, shape, size, texture, quantity, text, and spatial relationships of all objects and the background: "
+        if task == "multiid":
+            return "You will be provided with multiple reference images and a video caption. Your task is to generate a high-quality video that combines all the subjects from the images into a single coherent scene, consistent with the caption. Use the following text as the caption for the video: "
+        if task in ("v2v_edit", "i+v2v_edit"):
+            return "You will be given a video and an editing instruction. Your task is to generate a high-quality video by applying the specified edits, ensuring consistency in visual quality, temporal coherence, and alignment with the instruction: "
+        raise ValueError(f"task: {task} is not support")
 
     def prepare_latents(
         self,
@@ -333,6 +662,8 @@ class UniVideoPipeline(DiffusionPipeline):
             process_call_back = kwargs["process_call_back"]
         else:
             process_call_back = None
+        if generator is None and kwargs.get("seed") is not None:
+            generator = torch.Generator(device=self._execution_device).manual_seed(int(kwargs["seed"]))
 
         # 1. Check inputs and set defaults
         # TODO: remove this
@@ -390,11 +721,11 @@ class UniVideoPipeline(DiffusionPipeline):
             mllm_input_imgs = [] # [[PIL.Image.Image,...] x b]
             mllm_input_videos = [] # [[torch.tensor (f h w c) 0-255] x b]
             if cond_img_pil is not None:
-                mllm_input_imgs = [[cond_img_pil]]
+                mllm_input_imgs = self._add_cond_image_to_mllm_inputs(mllm_input_imgs, cond_img_pil)
             if cond_frames_uint8_fhwc is not None:
-                mllm_input_videos = [[cond_frames_uint8_fhwc]]
+                mllm_input_videos = self._add_cond_video_to_mllm_inputs(mllm_input_videos, cond_frames_uint8_fhwc)
             text_output = self.mllm_generation(
-                prompts=[prompts],
+                prompts=prompts if isinstance(prompts, list) else [prompts],
                 images=mllm_input_imgs,
                 videos=mllm_input_videos,
                 device=device,
@@ -436,12 +767,7 @@ class UniVideoPipeline(DiffusionPipeline):
         attention_mask = torch.ones_like(latents[:, :1], dtype=latents.dtype) # (b, 1, f, h, w)
         assert batch_size == 1, f"Does not support bs > 1 for now"
         is_cond = torch.zeros(latent_t, dtype=torch.bool, device=latents.device)
-        if self.univideo_config.mllm_use_ref_img or self.univideo_config.mllm_use_cond_pixels:
-            mllm_input_imgs = [] # [[PIL.Image.Image,...] x b]
-            mllm_input_videos = [] # [[torch.tensor (f h w c) 0-255] x b]
-        else:
-            mllm_input_imgs = None
-            mllm_input_videos = None
+        mllm_input_imgs, mllm_input_videos = self._init_mllm_visual_inputs()
 
         #  Reference Image
         if ref_images is not None:   # [[PIL.Image.Image,...]]
@@ -467,7 +793,7 @@ class UniVideoPipeline(DiffusionPipeline):
             assert cond_pixel_norm_fchw is not None
             # vit
             if self.univideo_config.mllm_use_cond_pixels:
-                mllm_input_imgs = [[cond_img_pil]]
+                mllm_input_imgs = self._add_cond_image_to_mllm_inputs(mllm_input_imgs, cond_img_pil)
 
             # vae
             cond_latents, cond_latents_attn_mask = self._vae_encode_pixel_values(cond_pixel_norm_fchw)  # b c f h w
@@ -483,23 +809,12 @@ class UniVideoPipeline(DiffusionPipeline):
             if self.univideo_config.mllm_use_cond_pixels:
                 # image editing
                 if cond_image_path is not None:  
-                    # i+i2i_edit
-                    if len(mllm_input_imgs) > 0: 
-                        mllm_input_imgs[0].append(cond_img_pil)
-                    # i2i_edit
-                    else:
-                        mllm_input_imgs = [[cond_img_pil]]
+                    mllm_input_imgs = self._add_cond_image_to_mllm_inputs(mllm_input_imgs, cond_img_pil)
                 # v2v_edit
                 elif cond_frames_uint8_fhwc is not None:  
-                    total = cond_frames_uint8_fhwc.shape[0]
-                    steps = min(total, self.univideo_config.mllm_cond_video_num_frames)
-                    idx = torch.linspace(0, total - 1, steps=steps, device=cond_frames_uint8_fhwc.device).round().long()
-                    cond_frames_uint8_fhwc = cond_frames_uint8_fhwc.index_select(0, idx)  # (steps,H,W,3) uint8
-                    print(f"[DEBUG] cond_frames_uint8_fhwc shape: {cond_frames_uint8_fhwc.shape}")
-                    if cond_frames_uint8_fhwc.shape[0] > 0:
-                        mllm_input_videos = [[cond_frames_uint8_fhwc]]
-                    else:
-                        print("[DEBUG] Skipping append: no frames selected for cond_frames_uint8_fhwc")
+                    mllm_input_videos = self._add_cond_video_to_mllm_inputs(
+                        mllm_input_videos, cond_frames_uint8_fhwc
+                    )
                 else:
                     raise ValueError(f"missing visual condition for editing tasks") 
 
@@ -519,24 +834,7 @@ class UniVideoPipeline(DiffusionPipeline):
         # MLLM encoding
         # Add task instruction
         print(f"[DEBUG] task type: {task}")
-        if task == "t2v":
-            task_inst = "You will be given a video caption. Your task is to generate a high quality video that accurately reflects the caption. Focus specifically on the color, shape, size, texture, quantity, text, spatial relationships and motion of all objects and the background: "
-        elif task == "i2i_edit":
-            task_inst = "You will be given an image and an editing instruction. Your task is to generate a high-quality image by applying the specified edits, ensuring consistency in visual quality and alignment with the instruction: "
-        elif task == "i+i2i_edit":
-            task_inst = "You will be given a reference image, an image to be modified, and an editing instruction. Your task is to generate a high-quality image by applying the specified edits, ensuring consistency with the reference image and alignment with the instruction: "
-        elif task == "t2i":
-            task_inst = "You will be given an image caption. Your task is to generate a high quality image that accurately reflects the caption. Focus specifically on the color, shape, size, texture, quantity, text, and spatial relationships of all objects and the background: "
-        elif task == "i2v":
-            task_inst = "You will be given an image and a video caption. Your task is to generate a high-quality video that extends the given image into motion while remaining consistent with the caption. Ensure temporal continuity and preserve the color, shape, size, texture, quantity, text, and spatial relationships of all objects and the background: "
-        elif task == "multiid":
-            task_inst = "You will be provided with multiple reference images and a video caption. Your task is to generate a high-quality video that combines all the subjects from the images into a single coherent scene, consistent with the caption. Use the following text as the caption for the video: "
-        elif task == "v2v_edit" or task == "i+v2v_edit":
-            task_inst = "You will be given a video and an editing instruction. Your task is to generate a high-quality video by applying the specified edits, ensuring consistency in visual quality, temporal coherence, and alignment with the instruction: "
-        else:
-            raise ValueError(f"task: {task} is not support") 
-    
-        prompts = [task_inst + p for p in prompts]
+        prompts = self._prefix_task_prompt(task, prompts)
 
 
         # 6. Encode input prompt with MLLM
@@ -555,7 +853,7 @@ class UniVideoPipeline(DiffusionPipeline):
             dtype=self.transformer.dtype
         )
         prompt_embeds_txt_vit, prompt_attention_mask_txt_vit = self.get_mllm_prompt_embeddings(
-            prompts=[prompts],
+            prompts=prompts,
             images=mllm_input_imgs,
             videos=mllm_input_videos,
             device=device,

@@ -1,0 +1,8 @@
+{"task":"t2v","prompt":"A car drives through rain at night.","target_video":"videos/sample_t2v.mp4"}
+{"task":"t2i","prompt":"A red teapot on a wooden table.","target_image":"images/sample_t2i.jpg"}
+{"task":"i2v","prompt":"The camera slowly pushes in.","cond_image":"images/first_frame.jpg","target_video":"videos/sample_i2v.mp4"}
+{"task":"i2i_edit","prompt":"Make the sky sunset orange.","cond_image":"images/source.jpg","target_image":"images/edited.jpg"}
+{"task":"i+i2i_edit","prompt":"Use the reference identity while changing the background.","ref_images":["refs/person.jpg"],"cond_image":"images/source.jpg","target_image":"images/edited_with_ref.jpg"}
+{"task":"v2v_edit","prompt":"Make it snowy.","cond_video":"videos/source.mp4","target_video":"videos/edited.mp4"}
+{"task":"multiid","prompt":"Two referenced people walk through a park.","ref_images":["refs/person_a.jpg","refs/person_b.jpg"],"target_video":"videos/multiid.mp4"}
+{"task":"i+v2v_edit","prompt":"Replace the object using the reference image.","ref_images":["refs/object.jpg"],"cond_video":"videos/source.mp4","target_video":"videos/edited_with_ref.mp4"}

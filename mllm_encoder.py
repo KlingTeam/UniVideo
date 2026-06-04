@@ -99,7 +99,8 @@ class MLLMInContext(PreTrainedModel):
                 config.mllm_id, 
                 attn_implementation="sdpa", 
                 # attn_implementation="flash_attention_2", 
-                torch_dtype=torch.bfloat16
+                torch_dtype=torch.bfloat16,
+                low_cpu_mem_usage=True,
             )
             # self.mllm_backbone.model.config.use_sliding_window = False
             # self.mllm_backbone.model.config.sliding_window = None
