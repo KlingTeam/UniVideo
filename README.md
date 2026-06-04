@@ -202,6 +202,7 @@ Univideo is flexible in its input and output configurations, supporting a wide r
 
 
 ## 🔔News
+- [2026-06-03]: The training script and instructions are now available in [TRAINING.md](TRAINING.md).
 - [2026-01-30]: UniVideo was accepted at ICLR 2026 🎉
 - [2026-01-07]: Released [Code](https://github.com/KlingTeam/UniVideo) and [Model](https://huggingface.co/KlingTeam/UniVideo).
 - [2025-10-09]: Released [Arxiv Preprint](https://arxiv.org/abs/2510.08377) and the [Project Page](https://congwei1230.github.io/UniVideo/)
