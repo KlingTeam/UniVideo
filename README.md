@@ -209,6 +209,52 @@ Univideo is flexible in its input and output configurations, supporting a wide r
 
 
 
+## 📊Benchmark
+
+
+### 1. Visual Understanding
+
+| Model | MMBench | MMMU | MM-Vet |
+| --- | ---: | ---: | ---: |
+| LLaVA-1.5 | 36.4 | **67.8** | 36.3 |
+| LLaVA-NeXT | 79.3 | 51.1 | 57.4 |
+| OmniGen2 | 79.1 | 53.1 | 61.8 |
+| BAGEL | **85.0** | 55.3 | **67.2** |
+| UniVideo | <u>83.5</u> | <u>58.6</u> | <u>66.6</u> |
+
+### 2. Text-to-Video Generation
+
+| Model | VBench T2V |
+| --- | ---: |
+| CogVideoX | 81.61 |
+| HunyuanVideo | 83.24 |
+| Show-o2 | 81.34 |
+| Wan2.1 | **84.70** |
+| UniVideo | <u>83.48</u> |
+
+### 3. Text-to-Image Generation
+
+| Model | GenEval |
+| --- | ---: |
+| SD3-medium | 0.74 |
+| FLUX.1-dev | 0.67 |
+| Janus-Pro | 0.80 |
+| BLIP3-o| **0.84** |
+| BAGEL | <u>0.82</u> |
+| OmniGen2 | 0.80 |
+| UniVideo| 0.69 |
+
+### 4. Image Editing
+
+| Model | ImgEdit Overall | GEdit SC | GEdit PQ | GEdit Overall |
+| --- | ---: | ---: | ---: | ---: |
+| GPT-4o | 4.20 | 7.85 | 7.62 | 7.53 |
+| Step1X-Edit | 3.06 | 7.09 | 6.76 | **6.70** |
+| BAGEL | 3.20 | **7.36** | 6.83 | <u>6.52</u> |
+| UniWorld-V1 | 3.26 | 4.93 | **7.43** | 4.85 |
+| OmniGen2 | 3.44 | <u>7.16</u> | 6.77 | 6.41 |
+| UniVideo | **3.83** | 7.08 | <u>7.08</u> | 6.41 |
+
 ## How to use
 
 ### 1. Installation
